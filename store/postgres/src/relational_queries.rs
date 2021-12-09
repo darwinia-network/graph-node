@@ -544,7 +544,11 @@ impl<'a> QueryFragment<Pg> for QueryValue<'a> {
                 }
                 ColumnType::TSVector(_) => {
                     out.push_sql("to_tsquery(");
-                    out.push_bind_param::<Text, _>(s)?;
+                    // let mut value = s.clone();
+                    // if value.contains(" ") {
+                    //     value = format!("'{}'", value);
+                    // }
+                    out.push_bind_param::<Text, _>(&s)?;
                     out.push_sql(")");
                     Ok(())
                 }
@@ -620,6 +624,40 @@ impl<'a> QueryFragment<Pg> for QueryValue<'a> {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::diesel::query_builder::QueryBuilder;
+    use diesel::{
+        pg::{Pg, PgQueryBuilder},
+        query_builder::{AstPass, QueryFragment},
+    };
+    use graph::{
+        data::schema::{FulltextAlgorithm, FulltextConfig, FulltextLanguage},
+        prelude::Value,
+    };
+
+    use super::QueryValue;
+    use crate::relational::ColumnType;
+
+    #[test]
+    fn test_whitespace_fulltext_search() {
+        let mut builder = PgQueryBuilder::default();
+        let out = AstPass::to_sql(&mut builder);
+        let s = Value::String("something with space".to_string());
+        let qv = QueryValue(
+            &s,
+            &ColumnType::TSVector(FulltextConfig {
+                algorithm: FulltextAlgorithm::Rank,
+                language: FulltextLanguage::English,
+            }),
+        );
+
+        qv.walk_ast(out).unwrap();
+        let s = builder.finish();
+        assert_eq!(s, "");
     }
 }
 
@@ -2197,7 +2235,11 @@ impl<'a> SortKey<'a> {
                 out.push_identifier(name)?;
                 out.push_sql(", to_tsquery(");
 
-                out.push_bind_param::<Text, _>(&value.unwrap())?;
+                let mut value = value.unwrap().to_string();
+                if value.contains(" ") {
+                    value = format!("'{}'", value);
+                }
+                out.push_bind_param::<Text, _>(&value.as_str())?;
                 out.push_sql("))");
             }
             _ => {

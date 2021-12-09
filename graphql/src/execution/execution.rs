@@ -401,6 +401,8 @@ pub async fn execute_root_selection_set<R: Resolver>(
                 &execute_root_type,
             ));
 
+            println!("queryres: {:?}", query_res);
+
             // Unwrap: In practice should never fail, but if it does we will catch the panic.
             execute_ctx.resolver.post_process(&mut query_res).unwrap();
             query_res.deployment = Some(execute_ctx.query.schema.id().clone());
