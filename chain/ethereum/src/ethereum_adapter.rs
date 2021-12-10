@@ -877,7 +877,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
                 let web3 = web3.cheap_clone();
                 async move {
                     web3.eth()
-                        .block(BlockId::Number(Web3BlockNumber::Number(0.into())))
+                        .block(BlockId::Number(Web3BlockNumber::Number(4969901.into())))
                         .await?
                         .map(|gen_block| gen_block.hash.map(BlockHash::from))
                         .flatten()
