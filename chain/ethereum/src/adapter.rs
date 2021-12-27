@@ -400,13 +400,15 @@ impl FromIterator<(BlockNumber, Address, FunctionSelector)> for EthereumCallFilt
     }
 }
 
-impl From<EthereumBlockFilter> for EthereumCallFilter {
-    fn from(ethereum_block_filter: EthereumBlockFilter) -> Self {
+impl From<&EthereumBlockFilter> for EthereumCallFilter {
+    fn from(ethereum_block_filter: &EthereumBlockFilter) -> Self {
         Self {
             contract_addresses_function_signatures: ethereum_block_filter
                 .contract_addresses
-                .into_iter()
-                .map(|(start_block_opt, address)| (address, (start_block_opt, HashSet::default())))
+                .iter()
+                .map(|(start_block_opt, address)| {
+                    (address.clone(), (*start_block_opt, HashSet::default()))
+                })
                 .collect::<HashMap<Address, (BlockNumber, HashSet<FunctionSelector>)>>(),
         }
     }
@@ -482,6 +484,16 @@ impl EthereumBlockFilter {
 
     fn requires_traces(&self) -> bool {
         !self.contract_addresses.is_empty()
+    }
+
+    /// An empty filter is one that never matches.
+    pub fn is_empty(&self) -> bool {
+        // If we are triggering every block, we are of course not empty
+        if self.trigger_every_block {
+            return false;
+        }
+
+        self.contract_addresses.is_empty()
     }
 }
 
@@ -627,7 +639,7 @@ pub trait EthereumAdapter: Send + Sync + 'static {
         &self,
         logger: &Logger,
         block: LightEthereumBlock,
-    ) -> Box<dyn Future<Item = EthereumBlock, Error = bc::IngestorError> + Send>;
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<EthereumBlock, bc::IngestorError>> + Send>>;
 
     /// Load block pointer for the specified `block number`.
     fn block_pointer_from_number(

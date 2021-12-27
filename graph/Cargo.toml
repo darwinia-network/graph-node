@@ -6,6 +6,7 @@ edition = "2018"
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1.50"
+async-stream = "0.3"
 atomic_refcell = "0.1.8"
 bigdecimal = { version = "0.1.0", features = ["serde"] }
 bytes = "1.0.1"
@@ -24,7 +25,7 @@ graphql-parser = "0.4.0"
 lazy_static = "1.4.0"
 mockall = "0.8.3"
 num-bigint = { version = "^0.2.6", features = ["serde"] }
-num_cpus = "1.13.0"
+num_cpus = "1.13.1"
 num-traits = "0.2.14"
 rand = "0.6.1"
 semver = {version = "1.0.3", features = ["serde"]}
@@ -41,7 +42,7 @@ slog-envlogger = "2.1.0"
 slog-term = "2.7.0"
 petgraph = "0.6.0"
 tiny-keccak = "1.5.0"
-tokio = { version = "1.14.0", features = ["time", "sync", "macros", "test-util", "rt-multi-thread", "parking_lot"] }
+tokio = { version = "1.15.0", features = ["time", "sync", "macros", "test-util", "rt-multi-thread", "parking_lot"] }
 tokio-stream = { version = "0.1.8", features = ["sync"] }
 tokio-retry = "0.3.0"
 url = "2.2.1"
@@ -54,7 +55,7 @@ futures03 = { version = "0.3.1", package = "futures", features = ["compat"] }
 wasmparser = "0.78.2"
 thiserror = "1.0.25"
 parking_lot = "0.11.2"
-itertools = "0.10.1"
+itertools = "0.10.3"
 
 # Our fork contains patches for custom http headers and to make some block fields optional.
 # Without the "arbitrary_precision" feature, we get the error `data did not match any variant of untagged enum Response`.

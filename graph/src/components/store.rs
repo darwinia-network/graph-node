@@ -588,7 +588,7 @@ impl StoreEvent {
         self
     }
 
-    pub fn matches(&self, filters: &Vec<SubscriptionFilter>) -> bool {
+    pub fn matches(&self, filters: &BTreeSet<SubscriptionFilter>) -> bool {
         self.changes
             .iter()
             .any(|change| filters.iter().any(|filter| filter.matches(change)))
@@ -623,6 +623,8 @@ pub struct StoreEventStream<S> {
 pub type StoreEventStreamBox =
     StoreEventStream<Box<dyn Stream<Item = Arc<StoreEvent>, Error = ()> + Send>>;
 
+pub type UnitStream = Box<dyn futures03::Stream<Item = ()> + Unpin + Send + Sync>;
+
 impl<S> Stream for StoreEventStream<S>
 where
     S: Stream<Item = Arc<StoreEvent>, Error = ()> + Send,
@@ -647,7 +649,7 @@ where
     /// Filter a `StoreEventStream` by subgraph and entity. Only events that have
     /// at least one change to one of the given (subgraph, entity) combinations
     /// will be delivered by the filtered stream.
-    pub fn filter_by_entities(self, filters: Vec<SubscriptionFilter>) -> StoreEventStreamBox {
+    pub fn filter_by_entities(self, filters: BTreeSet<SubscriptionFilter>) -> StoreEventStreamBox {
         let source = self.source.filter(move |event| event.matches(&filters));
 
         StoreEventStream::new(Box::new(source))
@@ -661,6 +663,8 @@ where
     /// on the returned stream as a single `StoreEvent`; the events are
     /// combined by using the maximum of all sources and the concatenation
     /// of the changes of the `StoreEvents` received during the interval.
+    //
+    // Currently unused, needs to be made compatible with `subscribe_no_payload`.
     pub async fn throttle_while_syncing(
         self,
         logger: &Logger,
@@ -848,7 +852,10 @@ pub trait SubscriptionManager: Send + Sync + 'static {
     /// Subscribe to changes for specific subgraphs and entities.
     ///
     /// Returns a stream of store events that match the input arguments.
-    fn subscribe(&self, entities: Vec<SubscriptionFilter>) -> StoreEventStreamBox;
+    fn subscribe(&self, entities: BTreeSet<SubscriptionFilter>) -> StoreEventStreamBox;
+
+    /// If the payload is not required, use for a more efficient subscription mechanism backed by a watcher.
+    fn subscribe_no_payload(&self, entities: BTreeSet<SubscriptionFilter>) -> UnitStream;
 }
 
 /// An internal identifer for the specific instance of a deployment. The
@@ -1316,6 +1323,21 @@ pub trait ChainStore: Send + Sync + 'static {
     ///
     /// The head block pointer will be None on initial set up.
     fn chain_head_ptr(&self) -> Result<Option<BlockPtr>, Error>;
+
+    /// Get the current head block cursor for this chain.
+    ///
+    /// The head block cursor will be None on initial set up.
+    fn chain_head_cursor(&self) -> Result<Option<String>, Error>;
+
+    /// This method does actually three operations:
+    /// - Upserts received block into blocks table
+    /// - Update chain head block into networks table
+    /// - Update chain head cursor into networks table
+    async fn set_chain_head(
+        self: Arc<Self>,
+        block: Arc<dyn Block>,
+        cursor: String,
+    ) -> Result<(), Error>;
 
     /// Returns the blocks present in the store.
     fn blocks(&self, hashes: &[H256]) -> Result<Vec<serde_json::Value>, Error>;
