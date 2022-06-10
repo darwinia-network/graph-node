@@ -57,6 +57,20 @@ type User @entity {
 }
 ";
 
+const GRAFT_IMMUTABLE_GQL: &str = "
+enum Color { yellow, red, blue, green }
+
+type User @entity(immutable: true) {
+    id: ID!,
+    name: String,
+    email: String,
+    age: Int,
+    favorite_color: Color,
+    # A column in the dst schema that does not exist in the src schema
+    added: String,
+}
+";
+
 const USER: &str = "User";
 
 macro_rules! block_pointer {
@@ -98,7 +112,7 @@ where
         remove_test_data(store.clone());
 
         // Seed database with test data
-        let deployment = insert_test_data(store.clone());
+        let deployment = insert_test_data(store.clone()).await;
 
         // Run test
         test(store, deployment).await.expect("graft test succeeds");
@@ -109,7 +123,7 @@ where
 ///
 /// Inserts data in test blocks 1, 2, and 3, leaving test blocks 3A, 4, and 4A for the tests to
 /// use.
-fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator {
+async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator {
     let manifest = SubgraphManifest::<graph_chain_ethereum::Chain> {
         id: TEST_SUBGRAPH_ID.clone(),
         spec_version: Version::new(1, 0, 0),
@@ -124,7 +138,7 @@ fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator {
     };
 
     // Create SubgraphDeploymentEntity
-    let deployment = SubgraphDeploymentEntity::new(&manifest, false, None);
+    let deployment = DeploymentCreate::new(&manifest, None);
     let name = SubgraphName::new("test/graft").unwrap();
     let node_id = NodeId::new("test").unwrap();
     let deployment = store
@@ -149,6 +163,7 @@ fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator {
         None,
     );
     transact_entity_operations(&store, &deployment, BLOCKS[0].clone(), vec![test_entity_1])
+        .await
         .unwrap();
 
     let test_entity_2 = create_test_entity(
@@ -177,6 +192,7 @@ fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator {
         BLOCKS[1].clone(),
         vec![test_entity_2, test_entity_3_1],
     )
+    .await
     .unwrap();
 
     let test_entity_3_2 = create_test_entity(
@@ -195,6 +211,7 @@ fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator {
         BLOCKS[2].clone(),
         vec![test_entity_3_2],
     )
+    .await
     .unwrap();
 
     deployment
@@ -249,20 +266,20 @@ fn remove_test_data(store: Arc<DieselSubgraphStore>) {
         .expect("deleting test entities succeeds");
 }
 
-fn create_grafted_subgraph(
+async fn create_grafted_subgraph(
     subgraph_id: &DeploymentHash,
     schema: &str,
     base_id: &str,
     base_block: BlockPtr,
 ) -> Result<DeploymentLocator, StoreError> {
     let base = Some((DeploymentHash::new(base_id).unwrap(), base_block));
-    test_store::create_subgraph(subgraph_id, schema, base)
+    test_store::create_subgraph(subgraph_id, schema, base).await
 }
 
-async fn check_graft(
-    store: Arc<DieselSubgraphStore>,
-    deployment: DeploymentLocator,
-) -> Result<(), StoreError> {
+fn find_entities(
+    store: &DieselSubgraphStore,
+    deployment: &DeploymentLocator,
+) -> (Vec<Entity>, Vec<String>) {
     let query = EntityQuery::new(
         deployment.hash.clone(),
         BLOCK_NUMBER_MAX,
@@ -281,10 +298,18 @@ async fn check_graft(
         .iter()
         .map(|entity| entity.id().unwrap())
         .collect::<Vec<_>>();
+    (entities, ids)
+}
+
+async fn check_graft(
+    store: Arc<DieselSubgraphStore>,
+    deployment: DeploymentLocator,
+) -> Result<(), StoreError> {
+    let (entities, ids) = find_entities(store.as_ref(), &deployment);
 
     assert_eq!(vec!["3", "1", "2"], ids);
 
-    // Make sure we caught Shqueena at block 1, before the change in
+    // Make sure we caught Shaqueeena at block 1, before the change in
     // email address
     let mut shaq = entities.first().unwrap().to_owned();
     assert_eq!(Some(&Value::from("queensha@email.com")), shaq.get("email"));
@@ -295,20 +320,27 @@ async fn check_graft(
         key: EntityKey::data(deployment.hash.clone(), USER.to_owned(), "3".to_owned()),
         data: shaq,
     };
-    transact_entity_operations(&store, &deployment, BLOCKS[2].clone(), vec![op]).unwrap();
+    transact_and_wait(&store, &deployment, BLOCKS[2].clone(), vec![op])
+        .await
+        .unwrap();
 
-    store
-        .cheap_clone()
-        .writable(LOGGER.clone(), deployment.id)
-        .await?
-        .revert_block_operations(BLOCKS[1].clone())
+    let writable = store.writable(LOGGER.clone(), deployment.id).await?;
+    writable
+        .revert_block_operations(BLOCKS[1].clone(), None)
+        .await
         .expect("We can revert a block we just created");
+    writable.flush().await.expect("we can revert to BLOCKS[1]");
 
-    let err = store
-        .writable(LOGGER.clone(), deployment.id)
-        .await?
-        .revert_block_operations(BLOCKS[0].clone())
-        .expect_err("Reverting past graft point is not allowed");
+    let err = {
+        match writable
+            .revert_block_operations(BLOCKS[0].clone(), None)
+            .await
+        {
+            Ok(()) => writable.flush().await,
+            Err(e) => Err(e),
+        }
+    }
+    .expect_err("Reverting past graft point is not allowed");
 
     assert!(err.to_string().contains("Can not revert subgraph"));
 
@@ -319,6 +351,8 @@ async fn check_graft(
 fn graft() {
     run_test(|store, _| async move {
         const SUBGRAPH: &str = "grafted";
+        const SUBGRAPH_ERR: &str = "grafted_err";
+        const SUBGRAPH_OK: &str = "grafted_ok";
 
         let subgraph_id = DeploymentHash::new(SUBGRAPH).unwrap();
 
@@ -328,9 +362,42 @@ fn graft() {
             TEST_SUBGRAPH_ID.as_str(),
             BLOCKS[1].clone(),
         )
+        .await
         .expect("can create grafted subgraph");
 
-        check_graft(store, deployment).await
+        check_graft(store.clone(), deployment).await.unwrap();
+
+        // The test data has an update for the entity with id 3 at block 1.
+        // We can therefore graft immutably onto block 0, but grafting onto
+        // block 1 fails because we see the deletion of the old version of
+        // the entity
+        let subgraph_id = DeploymentHash::new(SUBGRAPH_ERR).unwrap();
+
+        let err = create_grafted_subgraph(
+            &subgraph_id,
+            GRAFT_IMMUTABLE_GQL,
+            TEST_SUBGRAPH_ID.as_str(),
+            BLOCKS[1].clone(),
+        )
+        .await
+        .expect_err("grafting onto block 1 fails");
+        assert!(err.to_string().contains("can not be made immutable"));
+
+        let subgraph_id = DeploymentHash::new(SUBGRAPH_OK).unwrap();
+        let deployment = create_grafted_subgraph(
+            &subgraph_id,
+            GRAFT_IMMUTABLE_GQL,
+            TEST_SUBGRAPH_ID.as_str(),
+            BLOCKS[0].clone(),
+        )
+        .await
+        .expect("grafting onto block 0 works");
+
+        let (entities, ids) = find_entities(store.as_ref(), &deployment);
+        assert_eq!(vec!["1"], ids);
+        let shaq = entities.first().unwrap().to_owned();
+        assert_eq!(Some(&Value::from("tonofjohn@email.com")), shaq.get("email"));
+        Ok(())
     })
 }
 
@@ -360,7 +427,8 @@ fn copy() {
             .cheap_clone()
             .writable(LOGGER.clone(), deployment.id)
             .await?
-            .start_subgraph_deployment(&*LOGGER)?;
+            .start_subgraph_deployment(&*LOGGER)
+            .await?;
 
         store.activate(&deployment)?;
 

@@ -34,6 +34,14 @@ pub struct Opt {
         help = "name and IPFS hash of the subgraph manifest"
     )]
     pub subgraph: Option<String>,
+
+    #[structopt(
+        long,
+        value_name = "BLOCK_HASH:BLOCK_NUMBER",
+        help = "block hash and number that the subgraph passed will start indexing at"
+    )]
+    pub start_block: Option<String>,
+
     #[structopt(
         long,
         value_name = "URL",
@@ -103,7 +111,8 @@ pub struct Opt {
         long,
         default_value = "8000",
         value_name = "PORT",
-        help = "Port for the GraphQL HTTP server"
+        help = "Port for the GraphQL HTTP server",
+        env = "GRAPH_GRAPHQL_HTTP_PORT"
     )]
     pub http_port: u16,
     #[structopt(
@@ -117,7 +126,8 @@ pub struct Opt {
         long,
         default_value = "8001",
         value_name = "PORT",
-        help = "Port for the GraphQL WebSocket server"
+        help = "Port for the GraphQL WebSocket server",
+        env = "GRAPH_GRAPHQL_WS_PORT"
     )]
     pub ws_port: u16,
     #[structopt(
@@ -139,7 +149,7 @@ pub struct Opt {
         default_value = "default",
         value_name = "NODE_ID",
         env = "GRAPH_NODE_ID",
-        help = "a unique identifier for this node"
+        help = "a unique identifier for this node. Should have the same value between consecutive node restarts"
     )]
     pub node_id: String,
     #[structopt(long, help = "Enable debug logging")]
@@ -195,6 +205,16 @@ pub struct Opt {
         help = "Allows setting configurations that may result in incorrect Proofs of Indexing."
     )]
     pub unsafe_config: bool,
+
+    #[structopt(
+        long,
+        value_name = "IPFS_HASH",
+        help = "IPFS hash of the subgraph manifest that you want to fork"
+    )]
+    pub debug_fork: Option<String>,
+
+    #[structopt(long, value_name = "URL", help = "Base URL for forking subgraphs")]
+    pub fork_base: Option<String>,
 }
 
 impl From<Opt> for config::Opt {

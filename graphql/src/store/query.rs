@@ -1,11 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::mem::discriminant;
 
+use graph::data::value::Object;
 use graph::prelude::*;
 use graph::{components::store::EntityType, data::graphql::ObjectOrInterface};
 
+use crate::execution::ast as a;
 use crate::schema::ast as sast;
-use crate::store::prefetch::ObjectCondition;
+
+use super::prefetch::SelectedAttributes;
 
 #[derive(Debug)]
 enum OrderDirection {
@@ -16,42 +19,38 @@ enum OrderDirection {
 /// Builds a EntityQuery from GraphQL arguments.
 ///
 /// Panics if `entity` is not present in `schema`.
-pub fn build_query<'a>(
+pub(crate) fn build_query<'a>(
     entity: impl Into<ObjectOrInterface<'a>>,
     block: BlockNumber,
-    arguments: &HashMap<&str, r::Value>,
+    field: &a::Field,
     types_for_interface: &'a BTreeMap<EntityType, Vec<s::ObjectType>>,
     max_first: u32,
     max_skip: u32,
-    mut column_names: BTreeMap<ObjectCondition<'a>, AttributeNames>,
+    mut column_names: SelectedAttributes,
 ) -> Result<EntityQuery, QueryExecutionError> {
     let entity = entity.into();
     let entity_types = EntityCollection::All(match &entity {
         ObjectOrInterface::Object(object) => {
-            let selected_columns = column_names
-                .remove(&(*object).into())
-                .unwrap_or(AttributeNames::All);
+            let selected_columns = column_names.get(object);
             vec![((*object).into(), selected_columns)]
         }
         ObjectOrInterface::Interface(interface) => types_for_interface
             [&EntityType::from(*interface)]
             .iter()
             .map(|o| {
-                let selected_columns = column_names
-                    .remove(&o.into())
-                    .unwrap_or(AttributeNames::All);
+                let selected_columns = column_names.get(o);
                 (o.into(), selected_columns)
             })
             .collect(),
     });
     let mut query = EntityQuery::new(parse_subgraph_id(entity)?, block, entity_types)
-        .range(build_range(arguments, max_first, max_skip)?);
-    if let Some(filter) = build_filter(entity, arguments)? {
+        .range(build_range(field, max_first, max_skip)?);
+    if let Some(filter) = build_filter(entity, field)? {
         query = query.filter(filter);
     }
     let order = match (
-        build_order_by(entity, arguments)?,
-        build_order_direction(arguments)?,
+        build_order_by(entity, field)?,
+        build_order_direction(field)?,
     ) {
         (Some((attr, value_type)), OrderDirection::Ascending) => {
             EntityOrder::Ascending(attr, value_type)
@@ -67,11 +66,11 @@ pub fn build_query<'a>(
 
 /// Parses GraphQL arguments into a EntityRange, if present.
 fn build_range(
-    arguments: &HashMap<&str, r::Value>,
+    field: &a::Field,
     max_first: u32,
     max_skip: u32,
 ) -> Result<EntityRange, QueryExecutionError> {
-    let first = match arguments.get("first") {
+    let first = match field.argument_value("first") {
         Some(r::Value::Int(n)) => {
             let n = *n;
             if n > 0 && n <= (max_first as i64) {
@@ -86,7 +85,7 @@ fn build_range(
         _ => unreachable!("first is an Int with a default value"),
     };
 
-    let skip = match arguments.get("skip") {
+    let skip = match field.argument_value("skip") {
         Some(r::Value::Int(n)) => {
             let n = *n;
             if n >= 0 && n <= (max_skip as i64) {
@@ -110,12 +109,12 @@ fn build_range(
 /// Parses GraphQL arguments into an EntityFilter, if present.
 fn build_filter(
     entity: ObjectOrInterface,
-    arguments: &HashMap<&str, r::Value>,
+    field: &a::Field,
 ) -> Result<Option<EntityFilter>, QueryExecutionError> {
-    match arguments.get("where") {
+    match field.argument_value("where") {
         Some(r::Value::Object(object)) => build_filter_from_object(entity, object),
         Some(r::Value::Null) => Ok(None),
-        None => match arguments.get("text") {
+        None => match field.argument_value("text") {
             Some(r::Value::Object(filter)) => build_fulltext_filter_from_object(filter),
             None => Ok(None),
             _ => Err(QueryExecutionError::InvalidFilterError),
@@ -125,14 +124,14 @@ fn build_filter(
 }
 
 fn build_fulltext_filter_from_object(
-    object: &BTreeMap<String, r::Value>,
+    object: &Object,
 ) -> Result<Option<EntityFilter>, QueryExecutionError> {
     object.iter().next().map_or(
         Err(QueryExecutionError::FulltextQueryRequiresFilter),
         |(key, value)| {
             if let r::Value::String(s) = value {
                 Ok(Some(EntityFilter::Equal(
-                    key.clone(),
+                    key.to_string(),
                     Value::String(s.clone()),
                 )))
             } else {
@@ -142,15 +141,36 @@ fn build_fulltext_filter_from_object(
     )
 }
 
+fn parse_change_block_filter(value: &r::Value) -> Result<BlockNumber, QueryExecutionError> {
+    match value {
+        r::Value::Object(object) => i32::try_from_value(
+            object
+                .get("number_gte")
+                .ok_or_else(|| QueryExecutionError::InvalidFilterError)?,
+        )
+        .map_err(|_| QueryExecutionError::InvalidFilterError),
+        _ => Err(QueryExecutionError::InvalidFilterError),
+    }
+}
+
 /// Parses a GraphQL input object into an EntityFilter, if present.
 fn build_filter_from_object(
     entity: ObjectOrInterface,
-    object: &BTreeMap<String, r::Value>,
+    object: &Object,
 ) -> Result<Option<EntityFilter>, QueryExecutionError> {
     Ok(Some(EntityFilter::And({
         object
             .iter()
             .map(|(key, value)| {
+                // Special handling for _change_block input filter since its not a
+                // standard entity filter that is based on entity structure/fields
+                if key == "_change_block" {
+                    return match parse_change_block_filter(value) {
+                        Ok(block_number) => Ok(EntityFilter::ChangeBlockGte(block_number)),
+                        Err(e) => Err(e),
+                    };
+                }
+
                 use self::sast::FilterOp::*;
 
                 let (field_name, op) = sast::parse_field_as_filter(key);
@@ -174,11 +194,19 @@ fn build_filter_from_object(
                     In => EntityFilter::In(field_name, list_values(store_value, "_in")?),
                     NotIn => EntityFilter::NotIn(field_name, list_values(store_value, "_not_in")?),
                     Contains => EntityFilter::Contains(field_name, store_value),
+                    ContainsNoCase => EntityFilter::ContainsNoCase(field_name, store_value),
                     NotContains => EntityFilter::NotContains(field_name, store_value),
+                    NotContainsNoCase => EntityFilter::NotContainsNoCase(field_name, store_value),
                     StartsWith => EntityFilter::StartsWith(field_name, store_value),
+                    StartsWithNoCase => EntityFilter::StartsWithNoCase(field_name, store_value),
                     NotStartsWith => EntityFilter::NotStartsWith(field_name, store_value),
+                    NotStartsWithNoCase => {
+                        EntityFilter::NotStartsWithNoCase(field_name, store_value)
+                    }
                     EndsWith => EntityFilter::EndsWith(field_name, store_value),
+                    EndsWithNoCase => EntityFilter::EndsWithNoCase(field_name, store_value),
                     NotEndsWith => EntityFilter::NotEndsWith(field_name, store_value),
+                    NotEndsWithNoCase => EntityFilter::NotEndsWithNoCase(field_name, store_value),
                     Equal => EntityFilter::Equal(field_name, store_value),
                 })
             })
@@ -217,9 +245,9 @@ fn list_values(value: Value, filter_type: &str) -> Result<Vec<Value>, QueryExecu
 /// Parses GraphQL arguments into an field name to order by, if present.
 fn build_order_by(
     entity: ObjectOrInterface,
-    arguments: &HashMap<&str, r::Value>,
+    field: &a::Field,
 ) -> Result<Option<(String, ValueType)>, QueryExecutionError> {
-    match arguments.get("orderBy") {
+    match field.argument_value("orderBy") {
         Some(r::Value::Enum(name)) => {
             let field = sast::get_field(entity, name).ok_or_else(|| {
                 QueryExecutionError::EntityFieldError(entity.name().to_owned(), name.clone())
@@ -233,7 +261,7 @@ fn build_order_by(
                     )
                 })
         }
-        _ => match arguments.get("text") {
+        _ => match field.argument_value("text") {
             Some(r::Value::Object(filter)) => build_fulltext_order_by_from_object(filter),
             None => Ok(None),
             _ => Err(QueryExecutionError::InvalidFilterError),
@@ -242,13 +270,13 @@ fn build_order_by(
 }
 
 fn build_fulltext_order_by_from_object(
-    object: &BTreeMap<String, r::Value>,
+    object: &Object,
 ) -> Result<Option<(String, ValueType)>, QueryExecutionError> {
     object.iter().next().map_or(
         Err(QueryExecutionError::FulltextQueryRequiresFilter),
         |(key, value)| {
             if let r::Value::String(_) = value {
-                Ok(Some((key.clone(), ValueType::String)))
+                Ok(Some((key.to_string(), ValueType::String)))
             } else {
                 Err(QueryExecutionError::FulltextQueryRequiresFilter)
             }
@@ -257,11 +285,9 @@ fn build_fulltext_order_by_from_object(
 }
 
 /// Parses GraphQL arguments into a EntityOrder, if present.
-fn build_order_direction(
-    arguments: &HashMap<&str, r::Value>,
-) -> Result<OrderDirection, QueryExecutionError> {
-    Ok(arguments
-        .get("orderDirection")
+fn build_order_direction(field: &a::Field) -> Result<OrderDirection, QueryExecutionError> {
+    Ok(field
+        .argument_value("orderDirection")
         .map(|value| match value {
             r::Value::Enum(name) if name == "asc" => OrderDirection::Ascending,
             r::Value::Enum(name) if name == "desc" => OrderDirection::Descending,
@@ -291,11 +317,11 @@ pub fn parse_subgraph_id<'a>(
 }
 
 /// Recursively collects entities involved in a query field as `(subgraph ID, name)` tuples.
-pub fn collect_entities_from_query_field(
-    schema: &s::Document,
-    object_type: &s::ObjectType,
-    field: &q::Field,
-) -> BTreeSet<SubscriptionFilter> {
+pub(crate) fn collect_entities_from_query_field(
+    schema: &ApiSchema,
+    object_type: sast::ObjectType,
+    field: &a::Field,
+) -> Result<BTreeSet<SubscriptionFilter>, QueryExecutionError> {
     // Output entities
     let mut entities = HashSet::new();
 
@@ -305,11 +331,10 @@ pub fn collect_entities_from_query_field(
 
     while let Some((object_type, field)) = queue.pop_front() {
         // Check if the field exists on the object type
-        if let Some(field_type) = sast::get_field(object_type, &field.name) {
+        if let Some(field_type) = sast::get_field(&object_type, &field.name) {
             // Check if the field type corresponds to a type definition (in a valid schema,
             // this should always be the case)
-            if let Some(type_definition) = sast::get_type_definition_from_field(schema, field_type)
-            {
+            if let Some(type_definition) = schema.get_type_definition_from_field(field_type) {
                 // If the field's type definition is an object type, extract that type
                 if let s::TypeDefinition::Object(object_type) = type_definition {
                     // Only collect whether the field's type has an @entity directive
@@ -325,34 +350,39 @@ pub fn collect_entities_from_query_field(
 
                     // If the query field has a non-empty selection set, this means we
                     // need to recursively process it
-                    for selection in field.selection_set.items.iter() {
-                        if let q::Selection::Field(sub_field) = selection {
-                            queue.push_back((object_type, sub_field))
-                        }
+                    let object_type = schema.object_type(object_type).into();
+                    for sub_field in field.selection_set.fields_for(&object_type)? {
+                        queue.push_back((object_type.cheap_clone(), sub_field))
                     }
                 }
             }
         }
     }
 
-    entities
+    Ok(entities
         .into_iter()
         .map(|(id, entity_type)| SubscriptionFilter::Entities(id, EntityType::new(entity_type)))
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use graph::{
         components::store::EntityType,
-        prelude::s::{Directive, Field, InputValue, ObjectType, Type, Value as SchemaValue},
+        data::value::Object,
+        prelude::{
+            r, AttributeNames, EntityCollection, EntityFilter, EntityRange, Value, ValueType,
+            BLOCK_NUMBER_MAX,
+        },
+        prelude::{
+            s::{self, Directive, Field, InputValue, ObjectType, Type, Value as SchemaValue},
+            EntityOrder,
+        },
     };
     use graphql_parser::Pos;
-    use std::collections::{BTreeMap, HashMap};
+    use std::{collections::BTreeMap, iter::FromIterator, sync::Arc};
 
-    use graph::prelude::*;
-
-    use super::build_query;
+    use super::{a, build_query};
 
     fn default_object() -> ObjectType {
         let subgraph_id_argument = (
@@ -417,13 +447,34 @@ mod tests {
         }
     }
 
-    fn default_arguments<'a>() -> HashMap<&'a str, r::Value> {
-        let mut map = HashMap::new();
-        let first = "first";
-        let skip = "skip";
-        map.insert(first, r::Value::Int(100.into()));
-        map.insert(skip, r::Value::Int(0.into()));
-        map
+    fn default_field() -> a::Field {
+        let arguments = vec![
+            ("first".to_string(), r::Value::Int(100.into())),
+            ("skip".to_string(), r::Value::Int(0.into())),
+        ];
+        let obj_type = Arc::new(object("SomeType")).into();
+        a::Field {
+            position: Default::default(),
+            alias: None,
+            name: "aField".to_string(),
+            arguments,
+            directives: vec![],
+            selection_set: a::SelectionSet::new(vec![obj_type]),
+        }
+    }
+
+    fn default_field_with(arg_name: &str, arg_value: r::Value) -> a::Field {
+        let mut field = default_field();
+        field.arguments.push((arg_name.to_string(), arg_value));
+        field
+    }
+
+    fn default_field_with_vec(args: Vec<(&str, r::Value)>) -> a::Field {
+        let mut field = default_field();
+        for (name, value) in args {
+            field.arguments.push((name.to_string(), value));
+        }
+        field
     }
 
     #[test]
@@ -432,7 +483,7 @@ mod tests {
             build_query(
                 &object("Entity1"),
                 BLOCK_NUMBER_MAX,
-                &default_arguments(),
+                &default_field(),
                 &BTreeMap::new(),
                 std::u32::MAX,
                 std::u32::MAX,
@@ -446,7 +497,7 @@ mod tests {
             build_query(
                 &object("Entity2"),
                 BLOCK_NUMBER_MAX,
-                &default_arguments(),
+                &default_field(),
                 &BTreeMap::new(),
                 std::u32::MAX,
                 std::u32::MAX,
@@ -464,7 +515,7 @@ mod tests {
             build_query(
                 &default_object(),
                 BLOCK_NUMBER_MAX,
-                &default_arguments(),
+                &default_field(),
                 &BTreeMap::new(),
                 std::u32::MAX,
                 std::u32::MAX,
@@ -478,14 +529,12 @@ mod tests {
 
     #[test]
     fn build_query_parses_order_by_from_enum_values_correctly() {
-        let order_by = "orderBy".to_string();
-        let mut args = default_arguments();
-        args.insert(&order_by, r::Value::Enum("name".to_string()));
+        let field = default_field_with("orderBy", r::Value::Enum("name".to_string()));
         assert_eq!(
             build_query(
                 &default_object(),
                 BLOCK_NUMBER_MAX,
-                &args,
+                &field,
                 &BTreeMap::new(),
                 std::u32::MAX,
                 std::u32::MAX,
@@ -496,13 +545,12 @@ mod tests {
             EntityOrder::Ascending("name".to_string(), ValueType::String)
         );
 
-        let mut args = default_arguments();
-        args.insert(&order_by, r::Value::Enum("email".to_string()));
+        let field = default_field_with("orderBy", r::Value::Enum("email".to_string()));
         assert_eq!(
             build_query(
                 &default_object(),
                 BLOCK_NUMBER_MAX,
-                &args,
+                &field,
                 &BTreeMap::new(),
                 std::u32::MAX,
                 std::u32::MAX,
@@ -516,14 +564,12 @@ mod tests {
 
     #[test]
     fn build_query_ignores_order_by_from_non_enum_values() {
-        let order_by = "orderBy".to_string();
-        let mut args = default_arguments();
-        args.insert(&order_by, r::Value::String("name".to_string()));
+        let field = default_field_with("orderBy", r::Value::String("name".to_string()));
         assert_eq!(
             build_query(
                 &default_object(),
                 BLOCK_NUMBER_MAX,
-                &args,
+                &field,
                 &BTreeMap::new(),
                 std::u32::MAX,
                 std::u32::MAX,
@@ -534,13 +580,12 @@ mod tests {
             EntityOrder::Default
         );
 
-        let mut args = default_arguments();
-        args.insert(&order_by, r::Value::String("email".to_string()));
+        let field = default_field_with("orderBy", r::Value::String("email".to_string()));
         assert_eq!(
             build_query(
                 &default_object(),
                 BLOCK_NUMBER_MAX,
-                &args,
+                &field,
                 &BTreeMap::new(),
                 std::u32::MAX,
                 std::u32::MAX,
@@ -554,16 +599,15 @@ mod tests {
 
     #[test]
     fn build_query_parses_order_direction_from_enum_values_correctly() {
-        let order_by = "orderBy".to_string();
-        let order_direction = "orderDirection".to_string();
-        let mut args = default_arguments();
-        args.insert(&order_by, r::Value::Enum("name".to_string()));
-        args.insert(&order_direction, r::Value::Enum("asc".to_string()));
+        let field = default_field_with_vec(vec![
+            ("orderBy", r::Value::Enum("name".to_string())),
+            ("orderDirection", r::Value::Enum("asc".to_string())),
+        ]);
         assert_eq!(
             build_query(
                 &default_object(),
                 BLOCK_NUMBER_MAX,
-                &args,
+                &field,
                 &BTreeMap::new(),
                 std::u32::MAX,
                 std::u32::MAX,
@@ -574,14 +618,15 @@ mod tests {
             EntityOrder::Ascending("name".to_string(), ValueType::String)
         );
 
-        let mut args = default_arguments();
-        args.insert(&order_by, r::Value::Enum("name".to_string()));
-        args.insert(&order_direction, r::Value::Enum("desc".to_string()));
+        let field = default_field_with_vec(vec![
+            ("orderBy", r::Value::Enum("name".to_string())),
+            ("orderDirection", r::Value::Enum("desc".to_string())),
+        ]);
         assert_eq!(
             build_query(
                 &default_object(),
                 BLOCK_NUMBER_MAX,
-                &args,
+                &field,
                 &BTreeMap::new(),
                 std::u32::MAX,
                 std::u32::MAX,
@@ -592,17 +637,18 @@ mod tests {
             EntityOrder::Descending("name".to_string(), ValueType::String)
         );
 
-        let mut args = default_arguments();
-        args.insert(&order_by, r::Value::Enum("name".to_string()));
-        args.insert(
-            &order_direction,
-            r::Value::Enum("descending...".to_string()),
-        );
+        let field = default_field_with_vec(vec![
+            ("orderBy", r::Value::Enum("name".to_string())),
+            (
+                "orderDirection",
+                r::Value::Enum("descending...".to_string()),
+            ),
+        ]);
         assert_eq!(
             build_query(
                 &default_object(),
                 BLOCK_NUMBER_MAX,
-                &args,
+                &field,
                 &BTreeMap::new(),
                 std::u32::MAX,
                 std::u32::MAX,
@@ -614,16 +660,15 @@ mod tests {
         );
 
         // No orderBy -> EntityOrder::Default
-        let mut args = default_arguments();
-        args.insert(
-            &order_direction,
+        let field = default_field_with(
+            "orderDirection",
             r::Value::Enum("descending...".to_string()),
         );
         assert_eq!(
             build_query(
                 &default_object(),
                 BLOCK_NUMBER_MAX,
-                &args,
+                &field,
                 &BTreeMap::new(),
                 std::u32::MAX,
                 std::u32::MAX,
@@ -636,53 +681,12 @@ mod tests {
     }
 
     #[test]
-    fn build_query_ignores_order_direction_from_non_enum_values() {
-        let order_by = "orderBy".to_string();
-        let order_direction = "orderDirection".to_string();
-        let mut args = default_arguments();
-        args.insert(&order_by, r::Value::Enum("name".to_string()));
-        args.insert(&order_direction, r::Value::String("asc".to_string()));
-        assert_eq!(
-            build_query(
-                &default_object(),
-                BLOCK_NUMBER_MAX,
-                &args,
-                &BTreeMap::new(),
-                std::u32::MAX,
-                std::u32::MAX,
-                Default::default()
-            )
-            .unwrap()
-            .order,
-            EntityOrder::Ascending("name".to_string(), ValueType::String)
-        );
-
-        let mut args = default_arguments();
-        args.insert(&order_by, r::Value::Enum("name".to_string()));
-        args.insert(&order_direction, r::Value::String("desc".to_string()));
-        assert_eq!(
-            build_query(
-                &default_object(),
-                BLOCK_NUMBER_MAX,
-                &args,
-                &BTreeMap::new(),
-                std::u32::MAX,
-                std::u32::MAX,
-                Default::default()
-            )
-            .unwrap()
-            .order,
-            EntityOrder::Ascending("name".to_string(), ValueType::String)
-        );
-    }
-
-    #[test]
     fn build_query_yields_default_range_if_none_is_present() {
         assert_eq!(
             build_query(
                 &default_object(),
                 BLOCK_NUMBER_MAX,
-                &default_arguments(),
+                &default_field(),
                 &BTreeMap::new(),
                 std::u32::MAX,
                 std::u32::MAX,
@@ -696,14 +700,14 @@ mod tests {
 
     #[test]
     fn build_query_yields_default_first_if_only_skip_is_present() {
-        let skip = "skip".to_string();
-        let mut args = default_arguments();
-        args.insert(&skip, r::Value::Int(50));
+        let mut field = default_field();
+        field.arguments = vec![("skip".to_string(), r::Value::Int(50))];
+
         assert_eq!(
             build_query(
                 &default_object(),
                 BLOCK_NUMBER_MAX,
-                &args,
+                &field,
                 &BTreeMap::new(),
                 std::u32::MAX,
                 std::u32::MAX,
@@ -720,11 +724,9 @@ mod tests {
 
     #[test]
     fn build_query_yields_filters() {
-        let whre = "where".to_string();
-        let mut args = default_arguments();
-        args.insert(
-            &whre,
-            r::Value::Object(BTreeMap::from_iter(vec![(
+        let query_field = default_field_with(
+            "where",
+            r::Value::Object(Object::from_iter(vec![(
                 "name_ends_with".to_string(),
                 r::Value::String("ello".to_string()),
             )])),
@@ -736,7 +738,7 @@ mod tests {
                     ..default_object()
                 },
                 BLOCK_NUMBER_MAX,
-                &args,
+                &query_field,
                 &BTreeMap::new(),
                 std::u32::MAX,
                 std::u32::MAX,
@@ -748,6 +750,37 @@ mod tests {
                 "name".to_string(),
                 Value::String("ello".to_string()),
             )]))
+        )
+    }
+
+    #[test]
+    fn build_query_yields_block_change_gte_filter() {
+        let query_field = default_field_with(
+            "where",
+            r::Value::Object(Object::from_iter(vec![(
+                "_change_block".to_string(),
+                r::Value::Object(Object::from_iter(vec![(
+                    "number_gte".to_string(),
+                    r::Value::Int(10),
+                )])),
+            )])),
+        );
+        assert_eq!(
+            build_query(
+                &ObjectType {
+                    fields: vec![field("name", Type::NamedType("string".to_owned()))],
+                    ..default_object()
+                },
+                BLOCK_NUMBER_MAX,
+                &query_field,
+                &BTreeMap::new(),
+                std::u32::MAX,
+                std::u32::MAX,
+                Default::default()
+            )
+            .unwrap()
+            .filter,
+            Some(EntityFilter::And(vec![EntityFilter::ChangeBlockGte(10)]))
         )
     }
 }

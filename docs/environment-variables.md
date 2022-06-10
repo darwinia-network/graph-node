@@ -8,8 +8,10 @@ they have. Some environment variables can be used instead of command line flags.
 Those are not listed here, please consult `graph-node --help` for details on
 those.
 
-## Getting blocks from Ethereum
+## JSON-RPC configuration for EVM chains
 
+- `ETHEREUM_REORG_THRESHOLD`: Maximum expected reorg size, if a larger reorg
+happens, subgraphs might process inconsistent data. Defaults to 250.
 - `ETHEREUM_POLLING_INTERVAL`: how often to poll Ethereum for new blocks (in ms,
   defaults to 500ms)
 - `GRAPH_ETHEREUM_TARGET_TRIGGERS_PER_BLOCK_RANGE`: The ideal amount of triggers
@@ -38,6 +40,10 @@ those.
    The maximum number of concurrent requests made against Ethereum for
    requesting transaction receipts during block ingestion.
    Defaults to 1,000.
+- `GRAPH_ETHEREUM_FETCH_TXN_RECEIPTS_IN_BATCHES`: Set to `true` to
+  disable fetching receipts from the Ethereum node concurrently during
+  block ingestion. This will use fewer, batched requests. This is always set to `true`
+  on MacOS to avoid DNS issues.
 - `GRAPH_ETHEREUM_CLEANUP_BLOCKS` : Set to `true` to clean up unneeded
   blocks from the cache in the database. When this is `false` or unset (the
   default), blocks will never be removed from the block cache. This setting
@@ -64,21 +70,10 @@ those.
 - `GRAPH_MAX_IPFS_CACHE_FILE_SIZE`: maximum size of files that are cached in the
   `ipfs.cat` cache (defaults to 1MiB)
 - `GRAPH_ENTITY_CACHE_SIZE`: Size of the entity cache, in kilobytes. Defaults to 10000 which is 10MB.
-- `GRAPH_QUERY_CACHE_BLOCKS`: How many recent blocks per network should be kept
-   in the query cache. This should be kept small since the lookup time and the
-   cache memory usage are proportional to this value. Set to 0 to disable the cache.
-   Defaults to 1.
-- `GRAPH_QUERY_CACHE_MAX_MEM`: Maximum total memory to be used by the query
-   cache, in MB. The total amount of memory used for caching will be twice
-   this value - once for recent blocks, divided evenly among the
-   `GRAPH_QUERY_CACHE_BLOCKS`, and once for frequent queries against older
-   blocks.  The default is plenty for most loads, particularly if
-   `GRAPH_QUERY_CACHE_BLOCKS` is kept small.  Defaults to 1000, which
-   corresponds to 1GB.
-- `GRAPH_QUERY_CACHE_STALE_PERIOD`: Number of queries after which a cache
-  entry can be considered stale. Defaults to 100.
 - `GRAPH_MAX_API_VERSION`: Maximum `apiVersion` supported, if a developer tries to create a subgraph
-  with a higher `apiVersion` than this in their mappings, they'll receive an error. Defaults to `0.0.6`.
+  with a higher `apiVersion` than this in their mappings, they'll receive an error. Defaults to `0.0.7`.
+- `GRAPH_MAX_SPEC_VERSION`: Maximum `specVersion` supported. if a developer tries to create a subgraph
+  with a higher `apiVersion` than this, they'll receive an error. Defaults to `0.0.5`.
 - `GRAPH_RUNTIME_MAX_STACK_SIZE`: Maximum stack size for the WASM runtime, if exceeded the execution
   stops and an error is thrown. Defaults to 512KiB.
 
@@ -110,6 +105,8 @@ those.
 - `GRAPH_GRAPHQL_MAX_OPERATIONS_PER_CONNECTION`: maximum number of GraphQL
   operations per WebSocket connection. Any operation created after the limit
   will return an error to the client. Default: unlimited.
+- `GRAPH_GRAPHQL_HTTP_PORT` : Port for the GraphQL HTTP server
+- `GRAPH_GRAPHQL_WS_PORT` : Port for the GraphQL WebSocket server
 - `GRAPH_SQL_STATEMENT_TIMEOUT`: the maximum number of seconds an
   individual SQL query is allowed to take during GraphQL
   execution. Default: unlimited
@@ -118,11 +115,19 @@ those.
   this variable is set to any value, `graph-node` will still accept GraphQL
   subscriptions, but they won't receive any updates.
 
+### GraphQL caching
+
+- `GRAPH_CACHED_SUBGRAPH_IDS`: when set to `*`, cache all subgraphs (default behavior). Otherwise, a comma-separated list of subgraphs for which to cache queries.
+- `GRAPH_QUERY_CACHE_BLOCKS`: How many recent blocks per network should be kept in the query cache. This should be kept small since the lookup time and the cache memory usage are proportional to this value. Set to 0 to disable the cache. Defaults to 1.
+- `GRAPH_QUERY_CACHE_MAX_MEM`: Maximum total memory to be used by the query cache, in MB. The total amount of memory used for caching will be twice this value - once for recent blocks, divided evenly among the `GRAPH_QUERY_CACHE_BLOCKS`, and once for frequent queries against older blocks.  The default is plenty for most loads, particularly if `GRAPH_QUERY_CACHE_BLOCKS` is kept small. Defaults to 1000, which corresponds to 1GB.
+- `GRAPH_QUERY_CACHE_STALE_PERIOD`: Number of queries after which a cache entry can be considered stale. Defaults to 100.
+
 ## Miscellaneous
 
 - `GRAPH_NODE_ID`: sets the node ID, allowing to run multiple Graph Nodes
   in parallel and deploy to specific nodes; each ID must be unique among the set
-  of nodes.
+  of nodes. A single node should have the same value between consecutive restarts.
+  Subgraphs get assigned to node IDs and are not reassigned to other nodes automatically.
 - `GRAPH_LOG`: control log levels, the same way that `RUST_LOG` is described
   [here](https://docs.rs/env_logger/0.6.0/env_logger/)
 - `THEGRAPH_STORE_POSTGRES_DIESEL_URL`: postgres instance used when running
@@ -145,6 +150,7 @@ those.
   `gql`, also logs information for each toplevel GraphQL query field
   whether that could be retrieved from cache or not. Defaults to no
   logging.
+- `GRAPH_LOG_TIME_FORMAT`: Custom log time format.Default value is `%b %d %H:%M:%S%.3f`. More information [here](https://docs.rs/chrono/latest/chrono/#formatting-and-parsing).
 - `STORE_CONNECTION_POOL_SIZE`: How many simultaneous connections to allow to the store.
   Due to implementation details, this value may not be strictly adhered to. Defaults to 10.
 - `GRAPH_LOG_POI_EVENTS`: Logs Proof of Indexing events deterministically.

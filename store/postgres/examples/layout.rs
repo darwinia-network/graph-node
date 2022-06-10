@@ -1,7 +1,7 @@
 extern crate clap;
 extern crate graph_store_postgres;
 
-use clap::App;
+use clap::{arg, Command};
 use std::process::exit;
 use std::{fs, sync::Arc};
 
@@ -49,7 +49,7 @@ fn print_diesel_tables(layout: &Layout) {
         let mut dsl_type = match column.column_type {
             ColumnType::Boolean => "Bool",
             ColumnType::BigDecimal | ColumnType::BigInt => "Numeric",
-            ColumnType::Bytes | ColumnType::BytesId => "Binary",
+            ColumnType::Bytes => "Binary",
             ColumnType::Int => "Integer",
             ColumnType::String | ColumnType::Enum(_) | ColumnType::TSVector(_) => "Text",
         }
@@ -68,7 +68,7 @@ fn print_diesel_tables(layout: &Layout) {
         let mut dsl_type = match column.column_type {
             ColumnType::Boolean => "bool",
             ColumnType::BigDecimal | ColumnType::BigInt => "BigDecimal",
-            ColumnType::Bytes | ColumnType::BytesId => "Vec<u8>",
+            ColumnType::Bytes => "Vec<u8>",
             ColumnType::Int => "i32",
             ColumnType::String | ColumnType::Enum(_) | ColumnType::TSVector(_) => "String",
         }
@@ -121,14 +121,12 @@ fn print_diesel_tables(layout: &Layout) {
 }
 
 pub fn main() {
-    let args = App::new("layout")
+    let args = Command::new("layout")
     .version("1.0")
     .about("Information about the database schema for a GraphQL schema")
-    .args_from_usage(
-        "-g, --generate=[KIND] 'what kind of SQL to generate. Can be ddl (the default), migrate, delete, or drop'
-        <schema>
-        [db_schema]"
-    )
+    .arg(arg!(-g --generate <KIND> "what kind of SQL to generate. Can be ddl (the default), migrate, delete, or drop"))
+    .arg(arg!(<schema>))
+    .arg(arg!(<db_schema>))
     .get_matches();
 
     let schema = args.value_of("schema").unwrap();
@@ -147,11 +145,11 @@ pub fn main() {
     );
     let site = Arc::new(make_dummy_site(subgraph, namespace, "anet".to_string()));
     let catalog = ensure(
-        Catalog::make_empty(site.clone()),
+        Catalog::for_tests(site.clone()),
         "Failed to construct catalog",
     );
     let layout = ensure(
-        Layout::new(site, &schema, catalog, false),
+        Layout::new(site, &schema, catalog),
         "Failed to construct Mapping",
     );
     match kind {

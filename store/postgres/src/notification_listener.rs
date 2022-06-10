@@ -4,10 +4,10 @@ use diesel::sql_types::Text;
 use graph::prelude::tokio::sync::mpsc::error::SendTimeoutError;
 use graph::util::backoff::ExponentialBackoff;
 use lazy_static::lazy_static;
+use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use postgres::Notification;
-use postgres::{fallible_iterator::FallibleIterator, Client, NoTls};
-use std::env;
-use std::str::FromStr;
+use postgres::{fallible_iterator::FallibleIterator, Client};
+use postgres_openssl::MakeTlsConnector;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
@@ -16,27 +16,6 @@ use tokio::sync::mpsc::{channel, Receiver};
 
 use graph::prelude::serde_json;
 use graph::prelude::*;
-
-lazy_static! {
-    static ref LARGE_NOTIFICATION_CLEANUP_INTERVAL: Duration =
-        env::var("LARGE_NOTIFICATION_CLEANUP_INTERVAL")
-            .ok()
-            .map(
-                |s| Duration::from_secs(u64::from_str(&s).unwrap_or_else(|_| panic!(
-                    "failed to parse env var LARGE_NOTIFICATION_CLEANUP_INTERVAL"
-                )))
-            )
-            .unwrap_or(Duration::from_secs(300));
-    static ref NOTIFICATION_BROADCAST_TIMEOUT: Duration =
-        env::var("GRAPH_NOTIFICATION_BROADCAST_TIMEOUT")
-            .ok()
-            .map(
-                |s| Duration::from_secs(u64::from_str(&s).unwrap_or_else(|_| panic!(
-                    "failed to parse env var GRAPH_NOTIFICATION_BROADCAST_TIMEOUT"
-                )))
-            )
-            .unwrap_or(Duration::from_secs(60));
-}
 
 #[cfg(debug_assertions)]
 lazy_static::lazy_static! {
@@ -144,7 +123,12 @@ impl NotificationListener {
             let mut backoff =
                 ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(30));
             loop {
-                let res = Client::connect(postgres_url, NoTls).and_then(|mut conn| {
+                let mut builder = SslConnector::builder(SslMethod::tls())
+                    .expect("unable to create SslConnector builder");
+                builder.set_verify(SslVerifyMode::NONE);
+                let connector = MakeTlsConnector::new(builder.build());
+
+                let res = Client::connect(postgres_url, connector).and_then(|mut conn| {
                     conn.execute(format!("LISTEN {}", channel_name).as_str(), &[])?;
                     Ok(conn)
                 });
@@ -171,7 +155,7 @@ impl NotificationListener {
         debug!(
             logger,
             "Cleaning up large notifications after about {}s",
-            LARGE_NOTIFICATION_CLEANUP_INTERVAL.as_secs()
+            ENV_VARS.store.large_notification_cleanup_interval.as_secs(),
         );
 
         // Create two ends of a boolean variable for signalling when the worker
@@ -260,7 +244,7 @@ impl NotificationListener {
 
                         match JsonNotification::parse(&notification, &mut conn) {
                             Ok(json_notification) => {
-                                let timeout = *NOTIFICATION_BROADCAST_TIMEOUT;
+                                let timeout = ENV_VARS.store.notification_broadcast_timeout;
                                 match graph::block_on(
                                     sender.send_timeout(json_notification, timeout),
                                 ) {
@@ -354,7 +338,7 @@ impl JsonNotification {
         notification: &Notification,
         conn: &mut Client,
     ) -> Result<JsonNotification, StoreError> {
-        let value = serde_json::from_str(&notification.payload())?;
+        let value = serde_json::from_str(notification.payload())?;
 
         match value {
             serde_json::Value::Number(n) => {
@@ -412,7 +396,7 @@ pub struct NotificationSender {
 }
 
 impl NotificationSender {
-    pub fn new(registry: Arc<impl MetricsRegistry>) -> Self {
+    pub fn new(registry: Arc<dyn MetricsRegistry>) -> Self {
         let sent_counter = registry
             .global_counter_vec(
                 "notification_queue_sent",
@@ -472,12 +456,12 @@ impl NotificationSender {
 
             // If we can't get the lock, another thread in this process is
             // already checking, and we can just skip checking
-            if let Some(mut last_check) = LAST_CLEANUP_CHECK.try_lock().ok() {
-                if last_check.elapsed() > *LARGE_NOTIFICATION_CLEANUP_INTERVAL {
+            if let Ok(mut last_check) = LAST_CLEANUP_CHECK.try_lock() {
+                if last_check.elapsed() > ENV_VARS.store.large_notification_cleanup_interval {
                     diesel::sql_query(format!(
                         "delete from large_notifications
                          where created_at < current_timestamp - interval '{}s'",
-                        LARGE_NOTIFICATION_CLEANUP_INTERVAL.as_secs()
+                        ENV_VARS.store.large_notification_cleanup_interval.as_secs(),
                     ))
                     .execute(conn)?;
                     *last_check = Instant::now();

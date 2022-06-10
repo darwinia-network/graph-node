@@ -1,7 +1,8 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::result;
 use std::sync::Arc;
 
+use graph::data::value::Object;
 use graph::data::{
     graphql::{object, ObjectOrInterface},
     schema::META_FIELD_TYPE,
@@ -9,6 +10,7 @@ use graph::data::{
 use graph::prelude::*;
 use graph::{components::store::*, data::schema::BLOCK_FIELD_TYPE};
 
+use crate::execution::ast as a;
 use crate::query::ext::BlockConstraint;
 use crate::runner::ResultSizeMetrics;
 use crate::schema::ast as sast;
@@ -74,12 +76,7 @@ impl StoreResolver {
     ) -> Result<Self, QueryExecutionError> {
         let store_clone = store.cheap_clone();
         let deployment2 = deployment.clone();
-        let block_ptr = graph::spawn_blocking_allow_panic(move || {
-            Self::locate_block(store_clone.as_ref(), bc, deployment2.clone())
-        })
-        .await
-        .map_err(|e| QueryExecutionError::Panic(e.to_string()))
-        .and_then(|x| x)?; // Propagate panics.
+        let block_ptr = Self::locate_block(store_clone.as_ref(), bc, deployment2.clone()).await?;
 
         let has_non_fatal_errors = store
             .has_non_fatal_errors(Some(block_ptr.block_number()))
@@ -105,17 +102,16 @@ impl StoreResolver {
             .unwrap_or(BLOCK_NUMBER_MAX)
     }
 
-    fn locate_block(
+    async fn locate_block(
         store: &dyn QueryStore,
         bc: BlockConstraint,
         subgraph: DeploymentHash,
     ) -> Result<BlockPtr, QueryExecutionError> {
         fn check_ptr(
             subgraph: DeploymentHash,
-            ptr: Option<BlockPtr>,
+            ptr: BlockPtr,
             min: BlockNumber,
         ) -> Result<BlockPtr, QueryExecutionError> {
-            let ptr = ptr.expect("we should have already checked that the subgraph exists");
             if ptr.number < min {
                 return Err(QueryExecutionError::ValueParseError(
                     "block.number".to_owned(),
@@ -128,10 +124,17 @@ impl StoreResolver {
             }
             Ok(ptr)
         }
+
+        let subgraph_block_ptr = store
+            .block_ptr()
+            .await
+            .map_err(Into::into)
+            .map(|ptr| ptr.expect("we should have already checked that the subgraph exists"));
+
         match bc {
             BlockConstraint::Hash(hash) => {
-                store
-                    .block_number(hash)
+                let ptr = store
+                    .block_number(&hash)
                     .map_err(Into::into)
                     .and_then(|number| {
                         number
@@ -141,13 +144,16 @@ impl StoreResolver {
                                     "no block with that hash found".to_owned(),
                                 )
                             })
-                            .map(|number| BlockPtr::from((hash, number as u64)))
-                    })
+                            .map(|number| BlockPtr::new(hash, number))
+                    })?;
+
+                subgraph_block_ptr.and_then(|subgraph_ptr| {
+                    check_ptr(subgraph, subgraph_ptr, ptr.number)?;
+                    Ok(ptr)
+                })
             }
-            BlockConstraint::Number(number) => store
-                .block_ptr()
-                .map_err(|e| StoreError::from(e).into())
-                .and_then(|ptr| {
+            BlockConstraint::Number(number) => {
+                subgraph_block_ptr.and_then(|ptr| {
                     check_ptr(subgraph, ptr, number)?;
                     // We don't have a way here to look the block hash up from
                     // the database, and even if we did, there is no guarantee
@@ -156,18 +162,12 @@ impl StoreResolver {
                     // a block number
                     // See 7a7b9708-adb7-4fc2-acec-88680cb07ec1
                     Ok(BlockPtr::from((web3::types::H256::zero(), number as u64)))
-                }),
-            BlockConstraint::Min(number) => store
-                .block_ptr()
-                .map_err(|e| StoreError::from(e).into())
-                .and_then(|ptr| check_ptr(subgraph, ptr, number)),
-            BlockConstraint::Latest => store
-                .block_ptr()
-                .map_err(|e| StoreError::from(e).into())
-                .and_then(|ptr| {
-                    let ptr = ptr.expect("we should have already checked that the subgraph exists");
-                    Ok(ptr)
-                }),
+                })
+            }
+            BlockConstraint::Min(number) => {
+                subgraph_block_ptr.and_then(|ptr| check_ptr(subgraph, ptr, number))
+            }
+            BlockConstraint::Latest => subgraph_block_ptr,
         }
     }
 
@@ -207,20 +207,20 @@ impl StoreResolver {
                 number: number,
                 __typename: BLOCK_FIELD_TYPE
             };
-            map.insert("prefetch:block".to_string(), r::Value::List(vec![block]));
+            map.insert("prefetch:block".into(), r::Value::List(vec![block]));
             map.insert(
-                "deployment".to_string(),
+                "deployment".into(),
                 r::Value::String(self.deployment.to_string()),
             );
             map.insert(
-                "hasIndexingErrors".to_string(),
+                "hasIndexingErrors".into(),
                 r::Value::Boolean(self.has_non_fatal_errors),
             );
             map.insert(
-                "__typename".to_string(),
+                "__typename".into(),
                 r::Value::String(META_FIELD_TYPE.to_string()),
             );
-            return Ok((None, Some(r::Value::Object(map))));
+            return Ok((None, Some(r::Value::object(map))));
         }
         Ok((prefetched_object, None))
     }
@@ -230,14 +230,14 @@ impl StoreResolver {
 impl Resolver for StoreResolver {
     const CACHEABLE: bool = true;
 
-    async fn query_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
-        self.store.query_permit().await
+    async fn query_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, QueryExecutionError> {
+        self.store.query_permit().await.map_err(Into::into)
     }
 
     fn prefetch(
         &self,
         ctx: &ExecutionContext<Self>,
-        selection_set: &q::SelectionSet,
+        selection_set: &a::SelectionSet,
     ) -> Result<Option<r::Value>, Vec<QueryExecutionError>> {
         super::prefetch::run(self, ctx, selection_set, &self.result_size).map(Some)
     }
@@ -245,10 +245,9 @@ impl Resolver for StoreResolver {
     fn resolve_objects(
         &self,
         prefetched_objects: Option<r::Value>,
-        field: &q::Field,
+        field: &a::Field,
         _field_definition: &s::Field,
         object_type: ObjectOrInterface<'_>,
-        _arguments: &HashMap<&str, r::Value>,
     ) -> Result<r::Value, QueryExecutionError> {
         if let Some(child) = prefetched_objects {
             Ok(child)
@@ -265,10 +264,9 @@ impl Resolver for StoreResolver {
     fn resolve_object(
         &self,
         prefetched_object: Option<r::Value>,
-        field: &q::Field,
+        field: &a::Field,
         field_definition: &s::Field,
         object_type: ObjectOrInterface<'_>,
-        _arguments: &HashMap<&str, r::Value>,
     ) -> Result<r::Value, QueryExecutionError> {
         let (prefetched_object, meta) = self.handle_meta(prefetched_object, &object_type)?;
         if let Some(meta) = meta {
@@ -301,12 +299,13 @@ impl Resolver for StoreResolver {
 
     fn resolve_field_stream(
         &self,
-        schema: &s::Document,
+        schema: &ApiSchema,
         object_type: &s::ObjectType,
-        field: &q::Field,
+        field: &a::Field,
     ) -> result::Result<UnitStream, QueryExecutionError> {
         // Collect all entities involved in the query field
-        let entities = collect_entities_from_query_field(schema, object_type, field);
+        let object_type = schema.object_type(object_type).into();
+        let entities = collect_entities_from_query_field(schema, object_type, field)?;
 
         // Subscribe to the store and return the entity change stream
         Ok(self.subscription_manager.subscribe_no_payload(entities))
@@ -328,8 +327,9 @@ impl Resolver for StoreResolver {
             // or a different field queried under the response key `_meta`.
             ErrorPolicy::Deny => {
                 let data = result.take_data();
-                let meta = data.and_then(|mut d| d.remove_entry("_meta"));
-                result.set_data(meta.map(|m| BTreeMap::from_iter(Some(m))));
+                let meta =
+                    data.and_then(|mut d| d.remove("_meta").map(|m| ("_meta".to_string(), m)));
+                result.set_data(meta.map(|m| Object::from_iter(Some(m))));
             }
             ErrorPolicy::Allow => (),
         }

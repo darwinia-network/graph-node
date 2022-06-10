@@ -2,12 +2,12 @@ use anyhow::{anyhow, Error};
 use anyhow::{ensure, Context};
 use graph::blockchain::TriggerWithHandler;
 use graph::components::store::StoredDynamicDataSource;
+use graph::prelude::ethabi::ethereum_types::H160;
 use graph::prelude::ethabi::StateMutability;
 use graph::prelude::futures03::future::try_join;
 use graph::prelude::futures03::stream::FuturesOrdered;
-use graph::prelude::{Entity, Link, SubgraphManifestValidationError};
+use graph::prelude::{Link, SubgraphManifestValidationError};
 use graph::slog::{o, trace};
-use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::{convert::TryFrom, sync::Arc};
 use tiny_keccak::{keccak256, Keccak};
@@ -17,7 +17,7 @@ use graph::{
     prelude::{
         async_trait,
         ethabi::{Address, Contract, Event, Function, LogParam, ParamType, RawLog},
-        info, serde_json,
+        info, serde_json, warn,
         web3::types::{Log, Transaction, H256},
         BlockNumber, CheapClone, DataSourceTemplateInfo, Deserialize, EthereumCall,
         LightEthereumBlock, LightEthereumBlockExt, LinkResolver, Logger, TryStreamExt,
@@ -40,7 +40,8 @@ pub struct DataSource {
     pub kind: String,
     pub network: Option<String>,
     pub name: String,
-    pub source: Source,
+    pub address: Option<Address>,
+    pub start_block: BlockNumber,
     pub mapping: Mapping,
     pub context: Arc<Option<DataSourceContext>>,
     pub creation_block: Option<BlockNumber>,
@@ -49,17 +50,17 @@ pub struct DataSource {
 
 impl blockchain::DataSource<Chain> for DataSource {
     fn address(&self) -> Option<&[u8]> {
-        self.source.address.as_ref().map(|x| x.as_bytes())
+        self.address.as_ref().map(|x| x.as_bytes())
     }
 
     fn start_block(&self) -> BlockNumber {
-        self.source.start_block
+        self.start_block
     }
 
     fn match_and_decode(
         &self,
         trigger: &<Chain as Blockchain>::TriggerData,
-        block: Arc<<Chain as Blockchain>::Block>,
+        block: &Arc<<Chain as Blockchain>::Block>,
         logger: &Logger,
     ) -> Result<Option<TriggerWithHandler<Chain>>, Error> {
         let block = block.light_block();
@@ -91,14 +92,15 @@ impl blockchain::DataSource<Chain> for DataSource {
             kind,
             network,
             name,
-            source,
+            address,
             mapping,
             context,
 
             // The creation block is ignored for detection duplicate data sources.
-            // Contract ABI equality is implicit in `source` and `mapping.abis` equality.
+            // Contract ABI equality is implicit in `mapping.abis` equality.
             creation_block: _,
             contract_abi: _,
+            start_block: _,
         } = self;
 
         // mapping_request_sender, host_metrics, and (most of) host_exports are operational structs
@@ -107,7 +109,7 @@ impl blockchain::DataSource<Chain> for DataSource {
         kind == &other.kind
             && network == &other.network
             && name == &other.name
-            && source == &other.source
+            && address == &other.address
             && mapping.abis == other.mapping.abis
             && mapping.event_handlers == other.mapping.event_handlers
             && mapping.call_handlers == other.mapping.call_handlers
@@ -116,42 +118,41 @@ impl blockchain::DataSource<Chain> for DataSource {
     }
 
     fn as_stored_dynamic_data_source(&self) -> StoredDynamicDataSource {
+        let param = self.address.map(|addr| addr.0.into());
         StoredDynamicDataSource {
             name: self.name.to_owned(),
-            source: self.source.clone(),
+            param,
             context: self
                 .context
                 .as_ref()
                 .as_ref()
-                .map(|ctx| serde_json::to_string(&ctx).unwrap()),
+                .map(|ctx| serde_json::to_value(&ctx).unwrap()),
             creation_block: self.creation_block,
         }
     }
 
     fn from_stored_dynamic_data_source(
-        templates: &BTreeMap<&str, &DataSourceTemplate>,
+        template: &DataSourceTemplate,
         stored: StoredDynamicDataSource,
     ) -> Result<Self, Error> {
         let StoredDynamicDataSource {
-            name,
-            source,
+            name: _,
+            param,
             context,
             creation_block,
         } = stored;
-        let template = templates
-            .get(name.as_str())
-            .ok_or_else(|| anyhow!("no template named `{}` was found", name))?;
-        let context = context
-            .map(|ctx| serde_json::from_str::<Entity>(&ctx))
-            .transpose()?;
+
+        let context = context.map(serde_json::from_value).transpose()?;
 
         let contract_abi = template.mapping.find_abi(&template.source.abi)?;
 
+        let address = param.map(|x| H160::from_slice(&x));
         Ok(DataSource {
             kind: template.kind.to_string(),
             network: template.network.as_ref().map(|s| s.to_string()),
-            name,
-            source,
+            name: template.name.clone(),
+            address,
+            start_block: 0,
             mapping: template.mapping.clone(),
             context: Arc::new(context),
             creation_block,
@@ -197,6 +198,20 @@ impl blockchain::DataSource<Chain> for DataSource {
             errors.push(anyhow!("data source has duplicated block handlers"));
         }
 
+        // Validate that event handlers don't require receipts for API versions lower than 0.0.7
+        let api_version = self.api_version();
+        if api_version < semver::Version::new(0, 0, 7) {
+            for event_handler in &self.mapping.event_handlers {
+                if event_handler.receipt {
+                    errors.push(anyhow!(
+                        "data source has event handlers that require transaction receipts, but this \
+                         is only supported for apiVersion >= 0.0.7"
+                    ));
+                    break;
+                }
+            }
+        }
+
         errors
     }
 
@@ -228,7 +243,8 @@ impl DataSource {
             kind,
             network,
             name,
-            source,
+            address: source.address,
+            start_block: source.start_block,
             mapping,
             context: Arc::new(context),
             creation_block,
@@ -422,7 +438,7 @@ impl DataSource {
     }
 
     fn matches_trigger_address(&self, trigger: &EthereumTrigger) -> bool {
-        let ds_address = match self.source.address {
+        let ds_address = match self.address {
             Some(addr) => addr,
 
             // 'wildcard' data sources match any trigger address.
@@ -432,7 +448,7 @@ impl DataSource {
         let trigger_address = match trigger {
             EthereumTrigger::Block(_, EthereumBlockTriggerType::WithCallTo(address)) => address,
             EthereumTrigger::Call(call) => &call.to,
-            EthereumTrigger::Log(log) => &log.address,
+            EthereumTrigger::Log(log, _) => &log.address,
 
             // Unfiltered block triggers match any data source address.
             EthereumTrigger::Block(_, EthereumBlockTriggerType::Every) => return true,
@@ -446,14 +462,14 @@ impl DataSource {
     fn match_and_decode(
         &self,
         trigger: &EthereumTrigger,
-        block: Arc<LightEthereumBlock>,
+        block: &Arc<LightEthereumBlock>,
         logger: &Logger,
     ) -> Result<Option<TriggerWithHandler<Chain>>, Error> {
         if !self.matches_trigger_address(&trigger) {
             return Ok(None);
         }
 
-        if self.source.start_block > block.number() {
+        if self.start_block > block.number() {
             return Ok(None);
         }
 
@@ -464,11 +480,13 @@ impl DataSource {
                     None => return Ok(None),
                 };
                 Ok(Some(TriggerWithHandler::new(
-                    MappingTrigger::Block { block },
+                    MappingTrigger::Block {
+                        block: block.cheap_clone(),
+                    },
                     handler.handler,
                 )))
             }
-            EthereumTrigger::Log(log) => {
+            EthereumTrigger::Log(log, receipt) => {
                 let potential_handlers = self.handlers_for_log(log)?;
 
                 // Map event handlers to (event handler, event ABI) pairs; fail if there are
@@ -553,6 +571,7 @@ impl DataSource {
                         block_hash: block.hash,
                         block_number: block.number,
                         transaction_index: log.transaction_index,
+                        from: Some(H160::zero()),
                         ..Transaction::default()
                     }
                 };
@@ -560,13 +579,15 @@ impl DataSource {
                 let logging_extras = Arc::new(o! {
                     "signature" => event_handler.event.to_string(),
                     "address" => format!("{}", &log.address),
+                    "transaction" => format!("{}", &transaction.hash),
                 });
                 Ok(Some(TriggerWithHandler::new_with_logging_extras(
                     MappingTrigger::Log {
-                        block,
+                        block: block.cheap_clone(),
                         transaction: Arc::new(transaction),
                         log: log.cheap_clone(),
                         params,
+                        receipt: receipt.clone(),
                     },
                     event_handler.handler,
                     logging_extras,
@@ -597,15 +618,21 @@ impl DataSource {
                 // Take the input for the call, chop off the first 4 bytes, then call
                 // `function.decode_input` to get a vector of `Token`s. Match the `Token`s
                 // with the `Param`s in `function.inputs` to create a `Vec<LogParam>`.
-                let tokens = function_abi
-                    .decode_input(&call.input.0[4..])
-                    .with_context(|| {
+                let tokens = match function_abi.decode_input(&call.input.0[4..]).with_context(
+                    || {
                         format!(
                             "Generating function inputs for the call {:?} failed, raw input: {}",
                             &function_abi,
                             hex::encode(&call.input.0)
                         )
-                    })?;
+                    },
+                ) {
+                    Ok(val) => val,
+                    Err(err) => {
+                        warn!(logger, "Failed parsing inputs, skipping"; "error" => &err.to_string());
+                        return Ok(None);
+                    }
+                };
 
                 ensure!(
                     tokens.len() == function_abi.inputs.len(),
@@ -660,10 +687,11 @@ impl DataSource {
                 let logging_extras = Arc::new(o! {
                     "function" => handler.function.to_string(),
                     "to" => format!("{}", &call.to),
+                    "transaction" => format!("{}", &transaction.hash),
                 });
                 Ok(Some(TriggerWithHandler::new_with_logging_extras(
                     MappingTrigger::Call {
-                        block,
+                        block: block.cheap_clone(),
                         transaction,
                         call: call.cheap_clone(),
                         inputs,
@@ -691,7 +719,7 @@ pub struct UnresolvedDataSource {
 impl blockchain::UnresolvedDataSource<Chain> for UnresolvedDataSource {
     async fn resolve(
         self,
-        resolver: &impl LinkResolver,
+        resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
     ) -> Result<DataSource, anyhow::Error> {
         let UnresolvedDataSource {
@@ -703,7 +731,7 @@ impl blockchain::UnresolvedDataSource<Chain> for UnresolvedDataSource {
             context,
         } = self;
 
-        info!(logger, "Resolve data source"; "name" => &name, "source" => &source.start_block);
+        info!(logger, "Resolve data source"; "name" => &name, "source_address" => format_args!("{:?}", source.address), "source_start_block" => source.start_block);
 
         let mapping = mapping.resolve(&*resolver, logger).await?;
 
@@ -749,11 +777,8 @@ impl TryFrom<DataSourceTemplateInfo<Chain>> for DataSource {
             kind: template.kind,
             network: template.network,
             name: template.name,
-            source: Source {
-                address: Some(address),
-                abi: template.source.abi,
-                start_block: 0,
-            },
+            address: Some(address),
+            start_block: 0,
             mapping: template.mapping,
             context: Arc::new(context),
             creation_block: Some(creation_block),
@@ -778,7 +803,7 @@ pub type DataSourceTemplate = BaseDataSourceTemplate<Mapping>;
 impl blockchain::UnresolvedDataSourceTemplate<Chain> for UnresolvedDataSourceTemplate {
     async fn resolve(
         self,
-        resolver: &impl LinkResolver,
+        resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
     ) -> Result<DataSourceTemplate, anyhow::Error> {
         let UnresolvedDataSourceTemplate {
@@ -874,7 +899,7 @@ impl Mapping {
 impl UnresolvedMapping {
     pub async fn resolve(
         self,
-        resolver: &impl LinkResolver,
+        resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
     ) -> Result<Mapping, anyhow::Error> {
         let UnresolvedMapping {
@@ -940,7 +965,7 @@ pub struct MappingABI {
 impl UnresolvedMappingABI {
     pub async fn resolve(
         self,
-        resolver: &impl LinkResolver,
+        resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
     ) -> Result<MappingABI, anyhow::Error> {
         info!(
@@ -984,6 +1009,8 @@ pub struct MappingEventHandler {
     pub event: String,
     pub topic0: Option<H256>,
     pub handler: String,
+    #[serde(default)]
+    pub receipt: bool,
 }
 
 impl MappingEventHandler {

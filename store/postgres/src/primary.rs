@@ -23,10 +23,6 @@ use diesel::{
     Connection as _,
 };
 use graph::{
-    components::store::DeploymentId as GraphDeploymentId,
-    prelude::{chrono, CancelHandle, CancelToken},
-};
-use graph::{
     components::store::DeploymentLocator,
     constraint_violation,
     data::subgraph::status,
@@ -35,10 +31,15 @@ use graph::{
         EntityChangeOperation, NodeId, StoreError, SubgraphName, SubgraphVersionSwitchingMode,
     },
 };
+use graph::{
+    components::store::{DeploymentId as GraphDeploymentId, DeploymentSchemaVersion},
+    prelude::{chrono, CancelHandle, CancelToken},
+};
 use graph::{data::subgraph::schema::generate_entity_id, prelude::StoreEvent};
 use itertools::Itertools;
 use maybe_owned::MaybeOwned;
 use std::{
+    borrow::Borrow,
     collections::HashMap,
     convert::TryFrom,
     convert::TryInto,
@@ -114,16 +115,6 @@ table! {
     }
 }
 
-/// We used to support different layout schemes. The old 'Split' scheme
-/// which used JSONB layout has been removed, and we will only deal
-/// with relational layout. Trying to do anything with a 'Split' subgraph
-/// will result in an error.
-#[derive(DbEnum, Debug, Clone, Copy)]
-pub enum DeploymentSchemaVersion {
-    Split,
-    Relational,
-}
-
 table! {
     deployment_schemas(id) {
         id -> Integer,
@@ -132,7 +123,7 @@ table! {
         name -> Text,
         shard -> Text,
         /// The subgraph layout scheme used for this subgraph
-        version -> crate::primary::DeploymentSchemaVersionMapping,
+        version -> Integer,
         network -> Text,
         /// If there are multiple entries for the same IPFS hash (`subgraph`)
         /// only one of them will be active. That's the one we use for
@@ -198,9 +189,7 @@ struct Schema {
     pub subgraph: String,
     pub name: String,
     pub shard: String,
-    /// The version currently in use. Always `Relational`, attempts to load
-    /// schemas from the database with `Split` produce an error
-    version: DeploymentSchemaVersion,
+    version: i32,
     pub network: String,
     pub(crate) active: bool,
 }
@@ -274,6 +263,12 @@ impl ToSql<Text, Pg> for Namespace {
     }
 }
 
+impl Borrow<str> for Namespace {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A marker that an `i32` references a deployment. Values of this type hold
 /// the primary key from the `deployment_schemas` table
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, AsExpression, FromSqlRow)]
@@ -295,6 +290,12 @@ impl From<DeploymentId> for GraphDeploymentId {
 impl From<GraphDeploymentId> for DeploymentId {
     fn from(id: GraphDeploymentId) -> Self {
         DeploymentId(id.0)
+    }
+}
+
+impl From<DeploymentLocator> for DeploymentId {
+    fn from(loc: DeploymentLocator) -> Self {
+        Self::from(loc.id)
     }
 }
 
@@ -331,6 +332,8 @@ pub struct Site {
     /// exactly one for each `deployment`, i.e., other entries for that
     /// deployment have `active = false`
     pub(crate) active: bool,
+
+    pub(crate) schema_version: DeploymentSchemaVersion,
     /// Only the store and tests can create Sites
     _creation_disallowed: (),
 }
@@ -339,12 +342,6 @@ impl TryFrom<Schema> for Site {
     type Error = StoreError;
 
     fn try_from(schema: Schema) -> Result<Self, Self::Error> {
-        if matches!(schema.version, DeploymentSchemaVersion::Split) {
-            return Err(constraint_violation!(
-                "the subgraph {} uses JSONB layout which is not supported any longer",
-                schema.subgraph.as_str()
-            ));
-        }
         let deployment = DeploymentHash::new(&schema.subgraph)
             .map_err(|s| constraint_violation!("Invalid deployment id {}", s))?;
         let namespace = Namespace::new(schema.name.clone()).map_err(|nsp| {
@@ -355,6 +352,7 @@ impl TryFrom<Schema> for Site {
             )
         })?;
         let shard = Shard::new(schema.shard)?;
+        let schema_version = DeploymentSchemaVersion::try_from(schema.version)?;
         Ok(Self {
             id: schema.id,
             deployment,
@@ -362,6 +360,7 @@ impl TryFrom<Schema> for Site {
             shard,
             network: schema.network,
             active: schema.active,
+            schema_version,
             _creation_disallowed: (),
         })
     }
@@ -384,6 +383,7 @@ pub fn make_dummy_site(deployment: DeploymentHash, namespace: Namespace, network
         namespace,
         network,
         active: true,
+        schema_version: DeploymentSchemaVersion::V0,
         _creation_disallowed: (),
     }
 }
@@ -463,10 +463,7 @@ mod queries {
         match id {
             Some(id) => DeploymentHash::new(id)
                 .map_err(|id| constraint_violation!("illegal deployment id: {}", id)),
-            None => Err(StoreError::QueryExecutionError(format!(
-                "Subgraph `{}` not found",
-                name.as_str()
-            ))),
+            None => Err(StoreError::DeploymentNotFound(name.to_string())),
         }
     }
 
@@ -483,7 +480,7 @@ mod queries {
             .select(ds::all_columns)
             .load::<Schema>(conn)?
             .into_iter()
-            .map(|schema| Site::try_from(schema))
+            .map(Site::try_from)
             .collect::<Result<Vec<Site>, _>>()
     }
 
@@ -509,10 +506,7 @@ mod queries {
                 .filter(ds::active)
                 .first::<Schema>(conn)
         };
-        deployment
-            .optional()?
-            .map(|schema| Site::try_from(schema))
-            .transpose()
+        deployment.optional()?.map(Site::try_from).transpose()
     }
 
     /// Find sites by their subgraph deployment hashes. If `ids` is empty,
@@ -579,7 +573,7 @@ mod queries {
             .select(ds::all_columns)
             .load::<Schema>(conn)?
             .into_iter()
-            .map(|schema| Site::try_from(schema))
+            .map(Site::try_from)
             .collect::<Result<Vec<Site>, _>>()
     }
 
@@ -596,7 +590,7 @@ mod queries {
             .into_iter()
             .collect();
         for mut info in infos {
-            info.node = nodes.get(&info.subgraph).map(|s| s.clone());
+            info.node = nodes.get(&info.subgraph).cloned()
         }
         Ok(())
     }
@@ -841,7 +835,7 @@ impl<'a> Connection<'a> {
         exists_and_synced: F,
     ) -> Result<Vec<EntityChange>, StoreError>
     where
-        F: FnOnce(&DeploymentHash) -> Result<bool, StoreError>,
+        F: Fn(&DeploymentHash) -> Result<bool, StoreError>,
     {
         use subgraph as s;
         use subgraph_deployment_assignment as a;
@@ -882,7 +876,7 @@ impl<'a> Connection<'a> {
             .as_deref()
             .map(|id| {
                 DeploymentHash::new(id)
-                    .map_err(|e| StoreError::DeploymentNotFound(e))
+                    .map_err(StoreError::DeploymentNotFound)
                     .and_then(|id| exists_and_synced(&id))
             })
             .transpose()?
@@ -927,8 +921,11 @@ impl<'a> Connection<'a> {
 
         // See if we should make this the current or pending version
         let subgraph_row = update(s::table.filter(s::id.eq(&subgraph_id)));
-        match (mode, current_exists_and_synced) {
-            (Instant, _) | (Synced, false) => {
+        // When the new deployment is also synced already, we always want to
+        // overwrite the current version
+        let new_exists_and_synced = exists_and_synced(&site.deployment)?;
+        match (mode, current_exists_and_synced, new_exists_and_synced) {
+            (Instant, _, _) | (Synced, false, _) | (Synced, true, true) => {
                 subgraph_row
                     .set((
                         s::current_version.eq(&version_id),
@@ -936,7 +933,7 @@ impl<'a> Connection<'a> {
                     ))
                     .execute(conn)?;
             }
-            (Synced, true) => {
+            (Synced, true, false) => {
                 subgraph_row
                     .set(s::pending_version.eq(&version_id))
                     .execute(conn)?;
@@ -1047,10 +1044,10 @@ impl<'a> Connection<'a> {
         shard: Shard,
         deployment: DeploymentHash,
         network: String,
+        schema_version: DeploymentSchemaVersion,
         active: bool,
     ) -> Result<Site, StoreError> {
         use deployment_schemas as ds;
-        use DeploymentSchemaVersion as v;
 
         let conn = self.conn.as_ref();
 
@@ -1058,7 +1055,7 @@ impl<'a> Connection<'a> {
             .values((
                 ds::subgraph.eq(deployment.as_str()),
                 ds::shard.eq(shard.as_str()),
-                ds::version.eq(v::Relational),
+                ds::version.eq(schema_version as i32),
                 ds::network.eq(network.as_str()),
                 ds::active.eq(active),
             ))
@@ -1079,10 +1076,12 @@ impl<'a> Connection<'a> {
             namespace,
             network,
             active: true,
+            schema_version,
             _creation_disallowed: (),
         })
     }
 
+    /// Create a site for a brand new deployment.
     pub fn allocate_site(
         &self,
         shard: Shard,
@@ -1093,7 +1092,8 @@ impl<'a> Connection<'a> {
             return Ok(site);
         }
 
-        self.create_site(shard, subgraph.clone(), network, true)
+        let schema_version = DeploymentSchemaVersion::LATEST;
+        self.create_site(shard, subgraph.clone(), network, schema_version, true)
     }
 
     pub fn assigned_node(&self, site: &Site) -> Result<Option<NodeId>, StoreError> {
@@ -1110,7 +1110,21 @@ impl<'a> Connection<'a> {
             return Ok(site);
         }
 
-        self.create_site(shard, src.deployment.clone(), src.network.clone(), false)
+        if src.schema_version != DeploymentSchemaVersion::LATEST {
+            return Err(StoreError::Unknown(anyhow!(
+                "Attempted to copy from deployment {} which is on an old schema version.
+                This means a schema migration is ongoing, please try again later.",
+                src.id
+            )));
+        }
+
+        self.create_site(
+            shard,
+            src.deployment.clone(),
+            src.network.clone(),
+            src.schema_version,
+            false,
+        )
     }
 
     pub(crate) fn activate(&self, deployment: &DeploymentLocator) -> Result<(), StoreError> {
@@ -1159,9 +1173,9 @@ impl<'a> Connection<'a> {
         })
     }
 
-    pub fn find_site_by_name(&self, name: &str) -> Result<Option<Site>, StoreError> {
+    pub fn locate_site(&self, locator: DeploymentLocator) -> Result<Option<Site>, StoreError> {
         let schema = deployment_schemas::table
-            .filter(deployment_schemas::name.eq(name))
+            .filter(deployment_schemas::id.eq::<DeploymentId>(locator.into()))
             .first::<Schema>(self.conn.as_ref())
             .optional()?;
         schema.map(|schema| schema.try_into()).transpose()
@@ -1210,7 +1224,7 @@ impl<'a> Connection<'a> {
 
     /// Return the name of the node that has the fewest assignments out of the
     /// given `nodes`. If `nodes` is empty, return `None`
-    pub fn least_assigned_node(&self, nodes: &Vec<NodeId>) -> Result<Option<NodeId>, StoreError> {
+    pub fn least_assigned_node(&self, nodes: &[NodeId]) -> Result<Option<NodeId>, StoreError> {
         use subgraph_deployment_assignment as a;
 
         let nodes: Vec<_> = nodes.iter().map(|n| n.as_str()).collect();
@@ -1376,14 +1390,14 @@ impl<'a> Connection<'a> {
             .select(ds::all_columns)
             .load::<Schema>(self.conn.as_ref())?
             .into_iter()
-            .map(|schema| Site::try_from(schema))
+            .map(Site::try_from)
             .collect()
     }
 
     /// Add details from the deployment shard to unused deployments
     pub fn update_unused_deployments(
         &self,
-        details: &Vec<DeploymentDetail>,
+        details: &[DeploymentDetail],
     ) -> Result<(), StoreError> {
         use crate::detail::block;
         use unused_deployments as u;
@@ -1665,7 +1679,7 @@ impl Mirror {
         &self,
         name: &SubgraphName,
     ) -> Result<DeploymentHash, StoreError> {
-        self.read(|conn| queries::current_deployment_for_subgraph(conn, &name))
+        self.read(|conn| queries::current_deployment_for_subgraph(conn, name))
     }
 
     pub fn deployments_for_subgraph(&self, name: &str) -> Result<Vec<Site>, StoreError> {

@@ -1,14 +1,25 @@
+/// Rust representation of the GraphQL schema for a `SubgraphManifest`.
+pub mod schema;
+
+/// API version and spec version.
+pub mod api_version;
+pub use api_version::*;
+
+pub mod features;
+pub mod status;
+
+pub use features::{SubgraphFeature, SubgraphFeatureValidationError};
+
 use anyhow::ensure;
 use anyhow::{anyhow, Error};
 use futures03::{future::try_join3, stream::FuturesOrdered, TryStreamExt as _};
-use itertools::Itertools;
-use lazy_static::lazy_static;
 use semver::Version;
 use serde::de;
 use serde::ser;
 use serde_yaml;
 use slog::{debug, info, Logger};
-use stable_hash::prelude::*;
+use stable_hash::{FieldAddress, StableHash};
+use stable_hash_legacy::SequenceNumber;
 use std::{collections::BTreeSet, marker::PhantomData};
 use thiserror::Error;
 use wasmparser;
@@ -19,7 +30,7 @@ use crate::data::{
     schema::{Schema, SchemaImportError, SchemaValidationError},
     subgraph::features::validate_subgraph_features,
 };
-use crate::prelude::{r, CheapClone};
+use crate::prelude::{r, CheapClone, ENV_VARS};
 use crate::{blockchain::DataSource, data::graphql::TryFromValue};
 use crate::{blockchain::DataSourceTemplate as _, data::query::QueryExecutionError};
 use crate::{
@@ -36,44 +47,6 @@ use std::fmt;
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
-
-/// This version adds a new subgraph validation step that rejects manifests whose mappings have
-/// different API versions if at least one of them is equal to or higher than `0.0.5`.
-pub const API_VERSION_0_0_5: Version = Version::new(0, 0, 5);
-
-/// Before this check was introduced, there were already subgraphs in the wild with spec version
-/// 0.0.3, due to confusion with the api version. To avoid breaking those, we accept 0.0.3 though it
-/// doesn't exist. In the future we should not use 0.0.3 as version and skip to 0.0.4 to avoid
-/// ambiguity.
-pub const SPEC_VERSION_0_0_3: Version = Version::new(0, 0, 3);
-
-/// This version supports subgraph feature management.
-pub const SPEC_VERSION_0_0_4: Version = Version::new(0, 0, 4);
-
-pub const MIN_SPEC_VERSION: Version = Version::new(0, 0, 2);
-
-lazy_static! {
-    static ref DISABLE_GRAFTS: bool = std::env::var("GRAPH_DISABLE_GRAFTS")
-        .ok()
-        .map(|s| s.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    pub static ref MAX_SPEC_VERSION: Version = std::env::var("GRAPH_MAX_SPEC_VERSION")
-        .ok()
-        .and_then(|api_version_str| Version::parse(&api_version_str).ok())
-        .unwrap_or(SPEC_VERSION_0_0_4);
-    static ref MAX_API_VERSION: semver::Version = std::env::var("GRAPH_MAX_API_VERSION")
-        .ok()
-        .and_then(|api_version_str| semver::Version::parse(&api_version_str).ok())
-        .unwrap_or(semver::Version::new(0, 0, 6));
-}
-
-/// Rust representation of the GraphQL schema for a `SubgraphManifest`.
-pub mod schema;
-
-pub mod features;
-pub mod status;
-
-pub use features::{SubgraphFeature, SubgraphFeatureValidationError};
 
 /// Deserialize an Address (with or without '0x' prefix).
 fn deserialize_address<'de, D>(deserializer: D) -> Result<Option<Address>, D::Error>
@@ -96,10 +69,20 @@ where
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DeploymentHash(String);
 
-impl StableHash for DeploymentHash {
+impl stable_hash_legacy::StableHash for DeploymentHash {
     #[inline]
-    fn stable_hash<H: StableHasher>(&self, mut sequence_number: H::Seq, state: &mut H) {
-        self.0.stable_hash(sequence_number.next_child(), state);
+    fn stable_hash<H: stable_hash_legacy::StableHasher>(
+        &self,
+        mut sequence_number: H::Seq,
+        state: &mut H,
+    ) {
+        stable_hash_legacy::StableHash::stable_hash(&self.0, sequence_number.next_child(), state);
+    }
+}
+
+impl StableHash for DeploymentHash {
+    fn stable_hash<H: stable_hash::StableHasher>(&self, field_address: H::Addr, state: &mut H) {
+        stable_hash::StableHash::stable_hash(&self.0, field_address.child(0), state);
     }
 }
 
@@ -277,7 +260,7 @@ pub enum SubgraphRegistrarError {
     NameExists(String),
     #[error("subgraph name not found: {0}")]
     NameNotFound(String),
-    #[error("Ethereum network not supported by registrar: {0}")]
+    #[error("network not supported by registrar: {0}")]
     NetworkNotSupported(Error),
     #[error("deployment not found: {0}")]
     DeploymentNotFound(String),
@@ -422,7 +405,7 @@ impl UnresolvedSchema {
     pub async fn resolve(
         self,
         id: DeploymentHash,
-        resolver: &impl LinkResolver,
+        resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
     ) -> Result<Schema, anyhow::Error> {
         info!(logger, "Resolve schema"; "link" => &self.file.link);
@@ -461,59 +444,6 @@ pub fn calls_host_fn(runtime: &[u8], host_fn: &str) -> anyhow::Result<bool> {
     Ok(false)
 }
 
-#[derive(Clone, PartialEq, Debug)]
-pub struct UnifiedMappingApiVersion(Option<Version>);
-
-impl UnifiedMappingApiVersion {
-    pub fn equal_or_greater_than(&self, other_version: &Version) -> bool {
-        assert!(
-            other_version >= &API_VERSION_0_0_5,
-            "api versions before 0.0.5 should not be used for comparison"
-        );
-        match &self.0 {
-            Some(version) => version >= other_version,
-            None => false,
-        }
-    }
-
-    pub fn try_from_versions(
-        versions: impl Iterator<Item = Version>,
-    ) -> Result<Self, DifferentMappingApiVersions> {
-        let unique_versions: BTreeSet<Version> = versions.collect();
-
-        let all_below_referential_version = unique_versions.iter().all(|v| *v < API_VERSION_0_0_5);
-        let all_the_same = unique_versions.len() == 1;
-
-        let unified_version: Option<Version> = match (all_below_referential_version, all_the_same) {
-            (false, false) => return Err(unique_versions.into()),
-            (false, true) => Some(unique_versions.iter().nth(0).unwrap().deref().clone()),
-            (true, _) => None,
-        };
-
-        Ok(UnifiedMappingApiVersion(unified_version))
-    }
-}
-
-#[derive(Error, Debug, PartialEq)]
-#[error("Expected a single apiVersion for mappings. Found: {}.", format_versions(.0))]
-pub struct DifferentMappingApiVersions(BTreeSet<Version>);
-
-fn format_versions(versions: &BTreeSet<Version>) -> String {
-    versions.iter().map(ToString::to_string).join(", ")
-}
-
-impl From<BTreeSet<Version>> for DifferentMappingApiVersions {
-    fn from(versions: BTreeSet<Version>) -> Self {
-        Self(versions)
-    }
-}
-
-impl From<DifferentMappingApiVersions> for SubgraphManifestValidationError {
-    fn from(versions: DifferentMappingApiVersions) -> Self {
-        SubgraphManifestValidationError::DifferentApiVersions(versions.0)
-    }
-}
-
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Graft {
@@ -522,10 +452,20 @@ pub struct Graft {
 }
 
 impl Graft {
-    fn validate<S: SubgraphStore>(&self, store: Arc<S>) -> Vec<SubgraphManifestValidationError> {
-        fn gbi(msg: String) -> Vec<SubgraphManifestValidationError> {
-            vec![SubgraphManifestValidationError::GraftBaseInvalid(msg)]
-        }
+    async fn validate<S: SubgraphStore>(
+        &self,
+        store: Arc<S>,
+    ) -> Result<(), SubgraphManifestValidationError> {
+        use SubgraphManifestValidationError::*;
+
+        let last_processed_block = store
+            .least_block_ptr(&self.base)
+            .await
+            .map_err(|e| GraftBaseInvalid(e.to_string()))?;
+        let is_base_healthy = store
+            .is_healthy(&self.base)
+            .await
+            .map_err(|e| GraftBaseInvalid(e.to_string()))?;
 
         // We are being defensive here: we don't know which specific
         // instance of a subgraph we will use as the base for the graft,
@@ -533,22 +473,25 @@ impl Graft {
         // between this check and when the graft actually happens when the
         // subgraph is started. We therefore check that any instance of the
         // base subgraph is suitable.
-        match store.least_block_ptr(&self.base) {
-            Err(e) => gbi(e.to_string()),
-            Ok(None) => gbi(format!(
+        match (last_processed_block, is_base_healthy) {
+            (None, _) => Err(GraftBaseInvalid(format!(
                 "failed to graft onto `{}` since it has not processed any blocks",
                 self.base
-            )),
-            Ok(Some(ptr)) => {
-                if ptr.number < self.block {
-                    gbi(format!(
-                        "failed to graft onto `{}` at block {} since it has only processed block {}",
-                        self.base, self.block, ptr.number
-                    ))
-                } else {
-                    vec![]
-                }
-            }
+            ))),
+            (Some(ptr), true) if ptr.number < self.block => Err(GraftBaseInvalid(format!(
+                "failed to graft onto `{}` at block {} since it has only processed block {}",
+                self.base, self.block, ptr.number
+            ))),
+            // If the base deployment is failed *and* the `graft.block` is not
+            // less than the `base.block`, the graft shouldn't be permitted.
+            //
+            // The developer should change their `graft.block` in the manifest
+            // to `base.block - 1` or less.
+            (Some(ptr), false) if !(self.block < ptr.number) => Err(GraftBaseInvalid(format!(
+                "failed to graft onto `{}` at block {} since it's not healthy. You can graft it starting at block {} backwards",
+                self.base, self.block, ptr.number - 1
+            ))),
+            (Some(_), _) => Ok(()),
         }
     }
 }
@@ -597,20 +540,19 @@ impl<C: Blockchain> UnvalidatedSubgraphManifest<C> {
     pub async fn resolve(
         id: DeploymentHash,
         raw: serde_yaml::Mapping,
-        resolver: Arc<impl LinkResolver>,
+        resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
         max_spec_version: semver::Version,
     ) -> Result<Self, SubgraphManifestResolveError> {
         Ok(Self(
-            SubgraphManifest::resolve_from_raw(id, raw, resolver.deref(), logger, max_spec_version)
-                .await?,
+            SubgraphManifest::resolve_from_raw(id, raw, resolver, logger, max_spec_version).await?,
         ))
     }
 
     /// Validates the subgraph manifest file.
     ///
     /// Graft base validation will be skipped if the parameter `validate_graft_base` is false.
-    pub fn validate<S: SubgraphStore>(
+    pub async fn validate<S: SubgraphStore>(
         self,
         store: Arc<S>,
         validate_graft_base: bool,
@@ -661,13 +603,15 @@ impl<C: Blockchain> UnvalidatedSubgraphManifest<C> {
             });
 
         if let Some(graft) = &self.0.graft {
-            if *DISABLE_GRAFTS {
+            if ENV_VARS.disable_grafts {
                 errors.push(SubgraphManifestValidationError::GraftBaseInvalid(
                     "Grafting of subgraphs is currently disabled".to_owned(),
                 ));
             }
             if validate_graft_base {
-                errors.extend(graft.validate(store));
+                if let Err(graft_err) = graft.validate(store).await {
+                    errors.push(graft_err);
+                }
             }
         }
 
@@ -694,7 +638,7 @@ impl<C: Blockchain> SubgraphManifest<C> {
     pub async fn resolve_from_raw(
         id: DeploymentHash,
         mut raw: serde_yaml::Mapping,
-        resolver: &impl LinkResolver,
+        resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
         max_spec_version: semver::Version,
     ) -> Result<Self, SubgraphManifestResolveError> {
@@ -710,7 +654,7 @@ impl<C: Blockchain> SubgraphManifest<C> {
         debug!(logger, "Features {:?}", unresolved.features);
 
         unresolved
-            .resolve(&*resolver, logger, max_spec_version)
+            .resolve(resolver, logger, max_spec_version)
             .await
             .map_err(SubgraphManifestResolveError::ResolveError)
     }
@@ -734,12 +678,8 @@ impl<C: Blockchain> SubgraphManifest<C> {
     pub fn api_versions(&self) -> impl Iterator<Item = semver::Version> + '_ {
         self.templates
             .iter()
-            .map(|template| template.api_version().clone())
-            .chain(
-                self.data_sources
-                    .iter()
-                    .map(|source| source.api_version().clone()),
-            )
+            .map(|template| template.api_version())
+            .chain(self.data_sources.iter().map(|source| source.api_version()))
     }
 
     pub fn runtimes(&self) -> impl Iterator<Item = &[u8]> + '_ {
@@ -759,7 +699,7 @@ impl<C: Blockchain> SubgraphManifest<C> {
 impl<C: Blockchain> UnresolvedSubgraphManifest<C> {
     pub async fn resolve(
         self,
-        resolver: &impl LinkResolver,
+        resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
         max_spec_version: semver::Version,
     ) -> Result<SubgraphManifest<C>, anyhow::Error> {
@@ -787,15 +727,15 @@ impl<C: Blockchain> UnresolvedSubgraphManifest<C> {
         }
 
         let (schema, data_sources, templates) = try_join3(
-            schema.resolve(id.clone(), resolver, logger),
+            schema.resolve(id.clone(), &resolver, logger),
             data_sources
                 .into_iter()
-                .map(|ds| ds.resolve(resolver, logger))
+                .map(|ds| ds.resolve(&resolver, logger))
                 .collect::<FuturesOrdered<_>>()
                 .try_collect::<Vec<_>>(),
             templates
                 .into_iter()
-                .map(|template| template.resolve(resolver, logger))
+                .map(|template| template.resolve(&resolver, logger))
                 .collect::<FuturesOrdered<_>>()
                 .try_collect::<Vec<_>>(),
         )
@@ -803,11 +743,11 @@ impl<C: Blockchain> UnresolvedSubgraphManifest<C> {
 
         for ds in &data_sources {
             ensure!(
-                semver::VersionReq::parse(&format!("<= {}", *MAX_API_VERSION))
+                semver::VersionReq::parse(&format!("<= {}", ENV_VARS.mappings.max_api_version))
                     .unwrap()
                     .matches(&ds.api_version()),
                 "The maximum supported mapping API version of this indexer is {}, but `{}` was found",
-                *MAX_API_VERSION,
+                ENV_VARS.mappings.max_api_version,
                 ds.api_version()
             );
         }
@@ -854,7 +794,7 @@ impl DeploymentState {
     }
 }
 
-fn display_vector(input: &Vec<impl std::fmt::Display>) -> impl std::fmt::Display {
+fn display_vector(input: &[impl std::fmt::Display]) -> impl std::fmt::Display {
     let formatted_errors = input
         .iter()
         .map(ToString::to_string)
@@ -891,42 +831,6 @@ fn test_subgraph_name_validation() {
     assert!(SubgraphName::new("a/graphql").is_err());
     assert!(SubgraphName::new("graphql/a").is_err());
     assert!(SubgraphName::new("this-component-is-very-long-but-we-dont-care").is_ok());
-}
-
-#[test]
-fn unified_mapping_api_version_from_iterator() {
-    let input = [
-        vec![Version::new(0, 0, 5), Version::new(0, 0, 5)], // Ok(Some(0.0.5))
-        vec![Version::new(0, 0, 6), Version::new(0, 0, 6)], // Ok(Some(0.0.6))
-        vec![Version::new(0, 0, 3), Version::new(0, 0, 4)], // Ok(None)
-        vec![Version::new(0, 0, 4), Version::new(0, 0, 4)], // Ok(None)
-        vec![Version::new(0, 0, 3), Version::new(0, 0, 5)], // Err({0.0.3, 0.0.5})
-        vec![Version::new(0, 0, 6), Version::new(0, 0, 5)], // Err({0.0.5, 0.0.6})
-    ];
-    let output: [Result<UnifiedMappingApiVersion, DifferentMappingApiVersions>; 6] = [
-        Ok(UnifiedMappingApiVersion(Some(Version::new(0, 0, 5)))),
-        Ok(UnifiedMappingApiVersion(Some(Version::new(0, 0, 6)))),
-        Ok(UnifiedMappingApiVersion(None)),
-        Ok(UnifiedMappingApiVersion(None)),
-        Err(input[4]
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<Version>>()
-            .into()),
-        Err(input[5]
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<Version>>()
-            .into()),
-    ];
-    for (version_vec, expected_unified_version) in input.iter().zip(output.iter()) {
-        let unified = UnifiedMappingApiVersion::try_from_versions(version_vec.iter().cloned());
-        match (unified, expected_unified_version) {
-            (Ok(a), Ok(b)) => assert_eq!(a, *b),
-            (Err(a), Err(b)) => assert_eq!(a, *b),
-            _ => panic!(),
-        }
-    }
 }
 
 #[test]

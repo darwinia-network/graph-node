@@ -8,7 +8,6 @@ use std::fmt;
 use std::string::FromUtf8Error;
 use std::sync::Arc;
 
-use crate::data::graphql::SerializableValue;
 use crate::data::subgraph::*;
 use crate::prelude::q;
 use crate::{components::store::StoreError, prelude::CacheWeight};
@@ -41,6 +40,7 @@ pub enum QueryExecutionError {
     AbstractTypeError(String),
     InvalidArgumentError(Pos, String, q::Value),
     MissingArgumentError(Pos, String),
+    ValidationError(Option<Pos>, String),
     InvalidVariableTypeError(Pos, String),
     MissingVariableError(Pos, String),
     ResolveEntitiesError(String),
@@ -72,8 +72,6 @@ pub enum QueryExecutionError {
     TooExpensive,
     Throttled,
     UndefinedFragment(String),
-    // Using slow and prefetch query resolution yield different results
-    IncorrectPrefetchResult { slow: q::Value, prefetch: q::Value },
     Panic(String),
     EventStreamError,
     FulltextQueryRequiresFilter,
@@ -82,6 +80,7 @@ pub enum QueryExecutionError {
     SubgraphManifestResolveError(Arc<SubgraphManifestResolveError>),
     InvalidSubgraphManifest,
     ResultTooBig(usize, usize),
+    DeploymentNotFound(String),
 }
 
 impl QueryExecutionError {
@@ -92,6 +91,7 @@ impl QueryExecutionError {
             | OperationNotFound(_)
             | NotSupported(_)
             | NoRootSubscriptionObjectType
+            | NonNullError(_, _)
             | NamedTypeError(_)
             | AbstractTypeError(_)
             | InvalidArgumentError(_, _, _)
@@ -116,8 +116,7 @@ impl QueryExecutionError {
             | UndefinedFragment(_)
             | FulltextQueryInvalidSyntax(_)
             | FulltextQueryRequiresFilter => true,
-            NonNullError(_, _)
-            | ListValueError(_, _)
+            ListValueError(_, _)
             | ResolveEntitiesError(_)
             | RangeArgumentsError(_, _, _)
             | ValueParseError(_, _)
@@ -129,7 +128,6 @@ impl QueryExecutionError {
             | AmbiguousDerivedFromResult(_, _, _, _)
             | TooComplex(_, _)
             | TooDeep(_)
-            | IncorrectPrefetchResult { .. }
             | Panic(_)
             | EventStreamError
             | TooExpensive
@@ -137,7 +135,9 @@ impl QueryExecutionError {
             | DeploymentReverted
             | SubgraphManifestResolveError(_)
             | InvalidSubgraphManifest
-            | ResultTooBig(_, _) => false,
+            | ValidationError(_, _)
+            | ResultTooBig(_, _)
+            | DeploymentNotFound(_) => false,
         }
     }
 }
@@ -160,6 +160,9 @@ impl fmt::Display for QueryExecutionError {
             OperationNameRequired => write!(f, "Operation name required"),
             OperationNotFound(s) => {
                 write!(f, "Operation name not found `{}`", s)
+            }
+            ValidationError(_pos, message) => {
+                write!(f, "{}", message)
             }
             NotSupported(s) => write!(f, "Not supported: {}", s),
             NoRootSubscriptionObjectType => {
@@ -268,10 +271,6 @@ impl fmt::Display for QueryExecutionError {
             TooDeep(max_depth) => write!(f, "query has a depth that exceeds the limit of `{}`", max_depth),
             CyclicalFragment(name) =>write!(f, "query has fragment cycle including `{}`", name),
             UndefinedFragment(frag_name) => write!(f, "fragment `{}` is not defined", frag_name),
-            IncorrectPrefetchResult{ .. } => write!(f, "Running query with prefetch \
-                           and slow query resolution yielded different results. \
-                           This is a bug. Please open an issue at \
-                           https://github.com/graphprotocol/graph-node"),
             Panic(msg) => write!(f, "panic processing query: {}", msg),
             EventStreamError => write!(f, "error in the subscription event stream"),
             FulltextQueryRequiresFilter => write!(f, "fulltext search queries can only use EntityFilter::Equal"),
@@ -282,6 +281,7 @@ impl fmt::Display for QueryExecutionError {
             SubgraphManifestResolveError(e) => write!(f, "failed to resolve subgraph manifest: {}", e),
             InvalidSubgraphManifest => write!(f, "invalid subgraph manifest file"),
             ResultTooBig(actual, limit) => write!(f, "the result size of {} is larger than the allowed limit of {}", actual, limit),
+            DeploymentNotFound(id_or_name) => write!(f, "deployment `{}` does not exist", id_or_name)
         }
     }
 }
@@ -312,7 +312,12 @@ impl From<bigdecimal::ParseBigDecimalError> for QueryExecutionError {
 
 impl From<StoreError> for QueryExecutionError {
     fn from(e: StoreError) -> Self {
-        QueryExecutionError::StoreError(CloneableAnyhowError(Arc::new(e.into())))
+        match e {
+            StoreError::DeploymentNotFound(id_or_name) => {
+                QueryExecutionError::DeploymentNotFound(id_or_name)
+            }
+            _ => QueryExecutionError::StoreError(CloneableAnyhowError(Arc::new(e.into()))),
+        }
     }
 }
 
@@ -387,16 +392,7 @@ impl Serialize for QueryError {
     {
         use self::QueryExecutionError::*;
 
-        let entry_count =
-            if let QueryError::ExecutionError(QueryExecutionError::IncorrectPrefetchResult {
-                ..
-            }) = self
-            {
-                3
-            } else {
-                1
-            };
-        let mut map = serializer.serialize_map(Some(entry_count))?;
+        let mut map = serializer.serialize_map(Some(1))?;
 
         let msg = match self {
             // Serialize parse errors with their location (line, column) to make it easier
@@ -450,12 +446,6 @@ impl Serialize for QueryError {
                 location.insert("line", pos.line);
                 location.insert("column", pos.column);
                 map.serialize_entry("locations", &vec![location])?;
-                format!("{}", self)
-            }
-            QueryError::ExecutionError(IncorrectPrefetchResult { slow, prefetch }) => {
-                map.serialize_entry("incorrectPrefetch", &true)?;
-                map.serialize_entry("single", &SerializableValue(slow))?;
-                map.serialize_entry("prefetch", &SerializableValue(prefetch))?;
                 format!("{}", self)
             }
             _ => format!("{}", self),

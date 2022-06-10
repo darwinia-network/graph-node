@@ -1,14 +1,20 @@
-use ethereum::EthereumNetworks;
+use ethereum::chain::{EthereumAdapterSelector, EthereumStreamBuilder};
+use ethereum::{
+    BlockIngestor as EthereumBlockIngestor, EthereumAdapterTrait, EthereumNetworks, RuntimeAdapter,
+};
 use git_testament::{git_testament, render_testament};
-use graph::blockchain::block_ingestor::BlockIngestor;
 use graph::blockchain::firehose_block_ingestor::FirehoseBlockIngestor;
 use graph::blockchain::{Block as BlockchainBlock, Blockchain, BlockchainKind, BlockchainMap};
 use graph::components::store::BlockStore;
 use graph::data::graphql::effort::LoadManager;
-use graph::firehose::endpoints::{FirehoseNetworkEndpoints, FirehoseNetworks};
+use graph::env::EnvVars;
+use graph::firehose::{FirehoseEndpoints, FirehoseNetworks};
 use graph::log::logger;
 use graph::prelude::{IndexNodeServer as _, JsonRpcServer as _, *};
 use graph::prometheus::Registry;
+use graph::url::Url;
+use graph_chain_arweave::{self as arweave, Block as ArweaveBlock};
+use graph_chain_cosmos::{self as cosmos, Block as CosmosFirehoseBlock};
 use graph_chain_ethereum as ethereum;
 use graph_chain_near::{self as near, HeaderOnlyBlock as NearFirehoseHeaderOnlyBlock};
 use graph_core::{
@@ -18,7 +24,7 @@ use graph_core::{
 use graph_graphql::prelude::GraphQlRunner;
 use graph_node::chain::{
     connect_ethereum_networks, connect_firehose_networks, create_ethereum_networks,
-    create_firehose_networks, create_ipfs_clients, ANCESTOR_COUNT, REORG_THRESHOLD,
+    create_firehose_networks, create_ipfs_clients,
 };
 use graph_node::config::Config;
 use graph_node::opt;
@@ -29,6 +35,7 @@ use graph_server_json_rpc::JsonRpcServer;
 use graph_server_metrics::PrometheusMetricsServer;
 use graph_server_websocket::SubscriptionServer as GraphQLSubscriptionServer;
 use graph_store_postgres::{register_jobs as register_store_jobs, ChainHeadUpdateListener, Store};
+use near::NearStreamBuilder;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -94,6 +101,13 @@ async fn main() {
         graph::env::UNSAFE_CONFIG.store(true, atomic::Ordering::SeqCst);
     }
 
+    if !graph_server_index_node::PoiProtection::from_env(&ENV_VARS).is_active() {
+        warn!(
+            logger,
+            "GRAPH_POI_ACCESS_TOKEN not set; might leak POIs to the public via GraphQL"
+        );
+    }
+
     let config = match Config::load(&logger, &opt.clone().into()) {
         Err(e) => {
             eprintln!("configuration error: {}", e);
@@ -130,6 +144,29 @@ async fn main() {
     // Obtain metrics server port
     let metrics_port = opt.metrics_port;
 
+    // Obtain the fork base URL
+    let fork_base = match &opt.fork_base {
+        Some(url) => {
+            // Make sure the endpoint ends with a terminating slash.
+            let url = if !url.ends_with("/") {
+                let mut url = url.clone();
+                url.push('/');
+                Url::parse(&url)
+            } else {
+                Url::parse(url)
+            };
+
+            Some(url.expect("Failed to parse the fork base URL"))
+        }
+        None => {
+            warn!(
+                logger,
+                "No fork base URL specified, subgraph forking is disabled"
+            );
+            None
+        }
+    };
+
     info!(logger, "Starting up");
 
     // Optionally, identify the Elasticsearch logging configuration
@@ -140,6 +177,7 @@ async fn main() {
             endpoint: endpoint.clone(),
             username: opt.elasticsearch_user.clone(),
             password: opt.elasticsearch_password.clone(),
+            client: reqwest::Client::new(),
         });
 
     // Create a component and subgraph logger factory
@@ -150,7 +188,10 @@ async fn main() {
 
     // Convert the clients into a link resolver. Since we want to get past
     // possible temporary DNS failures, make the resolver retry
-    let link_resolver = Arc::new(LinkResolver::from(ipfs_clients));
+    let link_resolver = Arc::new(LinkResolver::new(
+        ipfs_clients,
+        Arc::new(EnvVars::default()),
+    ));
 
     // Set up Prometheus registry
     let prometheus_registry = Arc::new(Registry::new());
@@ -185,8 +226,14 @@ async fn main() {
 
     let expensive_queries = read_expensive_queries().unwrap();
 
-    let store_builder =
-        StoreBuilder::new(&logger, &node_id, &config, metrics_registry.cheap_clone()).await;
+    let store_builder = StoreBuilder::new(
+        &logger,
+        &node_id,
+        &config,
+        fork_base,
+        metrics_registry.cheap_clone(),
+    )
+    .await;
 
     let launch_services = |logger: Logger| async move {
         let subscription_manager = store_builder.subscription_manager();
@@ -198,8 +245,17 @@ async fn main() {
         // `blockchain_map`.
         let mut blockchain_map = BlockchainMap::new();
 
+        let (arweave_networks, arweave_idents) = connect_firehose_networks::<ArweaveBlock>(
+            &logger,
+            firehose_networks_by_kind
+                .remove(&BlockchainKind::Arweave)
+                .unwrap_or_else(|| FirehoseNetworks::new()),
+        )
+        .await;
+
         let (eth_networks, ethereum_idents) =
             connect_ethereum_networks(&logger, eth_networks).await;
+
         let (near_networks, near_idents) =
             connect_firehose_networks::<NearFirehoseHeaderOnlyBlock>(
                 &logger,
@@ -209,8 +265,31 @@ async fn main() {
             )
             .await;
 
-        let network_identifiers = ethereum_idents.into_iter().chain(near_idents).collect();
+        let (cosmos_networks, cosmos_idents) = connect_firehose_networks::<CosmosFirehoseBlock>(
+            &logger,
+            firehose_networks_by_kind
+                .remove(&BlockchainKind::Cosmos)
+                .unwrap_or_else(|| FirehoseNetworks::new()),
+        )
+        .await;
+
+        let network_identifiers = ethereum_idents
+            .into_iter()
+            .chain(arweave_idents)
+            .chain(near_idents)
+            .chain(cosmos_idents)
+            .collect();
+
         let network_store = store_builder.network_store(network_identifiers);
+
+        let arweave_chains = arweave_networks_as_chains(
+            &mut blockchain_map,
+            &logger,
+            &arweave_networks,
+            network_store.as_ref(),
+            &logger_factory,
+            metrics_registry.clone(),
+        );
 
         let ethereum_chains = ethereum_networks_as_chains(
             &mut blockchain_map,
@@ -230,6 +309,16 @@ async fn main() {
             &near_networks,
             network_store.as_ref(),
             &logger_factory,
+            metrics_registry.clone(),
+        );
+
+        let cosmos_chains = cosmos_networks_as_chains(
+            &mut blockchain_map,
+            &logger,
+            &cosmos_networks,
+            network_store.as_ref(),
+            &logger_factory,
+            metrics_registry.clone(),
         );
 
         let blockchain_map = Arc::new(blockchain_map);
@@ -257,23 +346,39 @@ async fn main() {
 
         let mut index_node_server = IndexNodeServer::new(
             &logger_factory,
+            blockchain_map.clone(),
             graphql_runner.clone(),
             network_store.clone(),
             link_resolver.clone(),
-            network_store.subgraph_store().clone(),
         );
 
         if !opt.disable_block_ingestor {
             if ethereum_chains.len() > 0 {
                 let block_polling_interval = Duration::from_millis(opt.ethereum_polling_interval);
 
-                start_block_ingestor(&logger, block_polling_interval, ethereum_chains);
+                start_block_ingestor(
+                    &logger,
+                    &logger_factory,
+                    block_polling_interval,
+                    ethereum_chains,
+                );
             }
+
+            start_firehose_block_ingestor::<_, ArweaveBlock>(
+                &logger,
+                &network_store,
+                arweave_chains,
+            );
 
             start_firehose_block_ingestor::<_, NearFirehoseHeaderOnlyBlock>(
                 &logger,
                 &network_store,
                 near_chains,
+            );
+            start_firehose_block_ingestor::<_, CosmosFirehoseBlock>(
+                &logger,
+                &network_store,
+                cosmos_chains,
             );
 
             // Start a task runner
@@ -286,34 +391,31 @@ async fn main() {
             );
             graph::spawn_blocking(job_runner.start());
         }
+        let static_filters = ENV_VARS.experimental_static_filters;
 
         let subgraph_instance_manager = SubgraphInstanceManager::new(
             &logger_factory,
             network_store.subgraph_store(),
             blockchain_map.cheap_clone(),
             metrics_registry.clone(),
-            link_resolver.cheap_clone(),
+            link_resolver.clone(),
+            static_filters,
         );
 
         // Create IPFS-based subgraph provider
         let subgraph_provider = IpfsSubgraphAssignmentProvider::new(
             &logger_factory,
-            link_resolver.cheap_clone(),
+            link_resolver.clone(),
             subgraph_instance_manager,
         );
 
         // Check version switching mode environment variable
-        let version_switching_mode = SubgraphVersionSwitchingMode::parse(
-            env::var_os("EXPERIMENTAL_SUBGRAPH_VERSION_SWITCHING_MODE")
-                .unwrap_or_else(|| "instant".into())
-                .to_str()
-                .expect("invalid version switching mode"),
-        );
+        let version_switching_mode = ENV_VARS.subgraph_version_switching_mode;
 
         // Create named subgraph provider for resolving subgraph name->ID mappings
         let subgraph_registrar = Arc::new(IpfsSubgraphRegistrar::new(
             &logger_factory,
-            link_resolver.cheap_clone(),
+            link_resolver,
             Arc::new(subgraph_provider),
             network_store.subgraph_store(),
             subscription_manager,
@@ -355,12 +457,35 @@ async fn main() {
                 .expect("Subgraph name must contain only a-z, A-Z, 0-9, '-' and '_'");
             let subgraph_id =
                 DeploymentHash::new(hash).expect("Subgraph hash must be a valid IPFS hash");
+            let debug_fork = opt
+                .debug_fork
+                .map(DeploymentHash::new)
+                .map(|h| h.expect("Debug fork hash must be a valid IPFS hash"));
+            let start_block = opt
+                .start_block
+                .map(|block| {
+                    let mut split = block.split(":");
+                    (
+                        // BlockHash
+                        split.next().unwrap().to_owned(),
+                        // BlockNumber
+                        split.next().unwrap().parse::<i64>().unwrap(),
+                    )
+                })
+                .map(|(hash, number)| BlockPtr::try_from((hash.as_str(), number)))
+                .map(Result::unwrap);
 
             graph::spawn(
                 async move {
                     subgraph_registrar.create_subgraph(name.clone()).await?;
                     subgraph_registrar
-                        .create_subgraph_version(name, subgraph_id, node_id)
+                        .create_subgraph_version(
+                            name,
+                            subgraph_id,
+                            node_id,
+                            debug_fork,
+                            start_block,
+                        )
                         .await
                 }
                 .map_err(|e| panic!("Failed to deploy subgraph from `--subgraph` flag: {}", e)),
@@ -422,7 +547,7 @@ async fn main() {
                                      "code" => LogCode::TokioContention);
             if timeout < Duration::from_secs(10) {
                 timeout *= 10;
-            } else if std::env::var_os("GRAPH_KILL_IF_UNRESPONSIVE").is_some() {
+            } else if ENV_VARS.kill_if_unresponsive {
                 // The node is unresponsive, kill it in hopes it will be restarted.
                 crit!(contention_logger, "Node is unresponsive, killing process");
                 std::process::abort()
@@ -431,6 +556,55 @@ async fn main() {
     });
 
     futures::future::pending::<()>().await;
+}
+
+/// Return the hashmap of Arweave chains and also add them to `blockchain_map`.
+fn arweave_networks_as_chains(
+    blockchain_map: &mut BlockchainMap,
+    logger: &Logger,
+    firehose_networks: &FirehoseNetworks,
+    store: &Store,
+    logger_factory: &LoggerFactory,
+    metrics_registry: Arc<MetricsRegistry>,
+) -> HashMap<String, FirehoseChain<arweave::Chain>> {
+    let chains: Vec<_> = firehose_networks
+        .networks
+        .iter()
+        .filter_map(|(chain_id, endpoints)| {
+            store
+                .block_store()
+                .chain_store(chain_id)
+                .map(|chain_store| (chain_id, chain_store, endpoints))
+                .or_else(|| {
+                    error!(
+                        logger,
+                        "No store configured for Arweave chain {}; ignoring this chain", chain_id
+                    );
+                    None
+                })
+        })
+        .map(|(chain_id, chain_store, endpoints)| {
+            (
+                chain_id.clone(),
+                FirehoseChain {
+                    chain: Arc::new(arweave::Chain::new(
+                        logger_factory.clone(),
+                        chain_id.clone(),
+                        chain_store,
+                        endpoints.clone(),
+                        metrics_registry.clone(),
+                    )),
+                    firehose_endpoints: endpoints.clone(),
+                },
+            )
+        })
+        .collect();
+
+    for (chain_id, firehose_chain) in chains.iter() {
+        blockchain_map.insert::<arweave::Chain>(chain_id.clone(), firehose_chain.chain.clone())
+    }
+
+    HashMap::from_iter(chains)
 }
 
 /// Return the hashmap of ethereum chains and also add them to `blockchain_map`.
@@ -468,6 +642,23 @@ fn ethereum_networks_as_chains(
         .map(|(network_name, eth_adapters, chain_store, is_ingestible)| {
             let firehose_endpoints = firehose_networks.and_then(|v| v.networks.get(network_name));
 
+            let adapter_selector = EthereumAdapterSelector::new(
+                logger_factory.clone(),
+                Arc::new(eth_adapters.clone()),
+                Arc::new(
+                    firehose_endpoints
+                        .map(|fe| fe.clone())
+                        .unwrap_or(FirehoseEndpoints::new()),
+                ),
+                registry.clone(),
+                chain_store.clone(),
+            );
+
+            let runtime_adapter = Arc::new(RuntimeAdapter {
+                eth_adapters: Arc::new(eth_adapters.clone()),
+                call_cache: chain_store.cheap_clone(),
+            });
+
             let chain = ethereum::Chain::new(
                 logger_factory.clone(),
                 network_name.clone(),
@@ -475,12 +666,13 @@ fn ethereum_networks_as_chains(
                 registry.clone(),
                 chain_store.cheap_clone(),
                 chain_store,
-                store.subgraph_store(),
-                firehose_endpoints.map_or_else(|| FirehoseNetworkEndpoints::new(), |v| v.clone()),
+                firehose_endpoints.map_or_else(|| FirehoseEndpoints::new(), |v| v.clone()),
                 eth_adapters.clone(),
                 chain_head_update_listener.clone(),
-                *ANCESTOR_COUNT,
-                *REORG_THRESHOLD,
+                Arc::new(EthereumStreamBuilder {}),
+                Arc::new(adapter_selector),
+                runtime_adapter,
+                ethereum::ENV_VARS.reorg_threshold,
                 is_ingestible,
             );
             (network_name.clone(), Arc::new(chain))
@@ -494,14 +686,14 @@ fn ethereum_networks_as_chains(
     HashMap::from_iter(chains)
 }
 
-/// Return the hashmap of NEAR chains and also add them to `blockchain_map`.
-fn near_networks_as_chains(
+fn cosmos_networks_as_chains(
     blockchain_map: &mut BlockchainMap,
     logger: &Logger,
     firehose_networks: &FirehoseNetworks,
     store: &Store,
     logger_factory: &LoggerFactory,
-) -> HashMap<String, FirehoseChain<near::Chain>> {
+    metrics_registry: Arc<MetricsRegistry>,
+) -> HashMap<String, FirehoseChain<cosmos::Chain>> {
     let chains: Vec<_> = firehose_networks
         .networks
         .iter()
@@ -513,7 +705,8 @@ fn near_networks_as_chains(
                 .or_else(|| {
                     error!(
                         logger,
-                        "No store configured for NEAR chain {}; ignoring this chain", network_name
+                        "No store configured for Cosmos chain {}; ignoring this chain",
+                        network_name
                     );
                     None
                 })
@@ -522,11 +715,12 @@ fn near_networks_as_chains(
             (
                 network_name.clone(),
                 FirehoseChain {
-                    chain: Arc::new(near::Chain::new(
+                    chain: Arc::new(cosmos::Chain::new(
                         logger_factory.clone(),
                         network_name.clone(),
                         chain_store,
                         firehose_endpoints.clone(),
+                        metrics_registry.clone(),
                     )),
                     firehose_endpoints: firehose_endpoints.clone(),
                 },
@@ -535,8 +729,58 @@ fn near_networks_as_chains(
         .collect();
 
     for (network_name, firehose_chain) in chains.iter() {
+        blockchain_map.insert::<cosmos::Chain>(network_name.clone(), firehose_chain.chain.clone())
+    }
+
+    HashMap::from_iter(chains)
+}
+
+/// Return the hashmap of NEAR chains and also add them to `blockchain_map`.
+fn near_networks_as_chains(
+    blockchain_map: &mut BlockchainMap,
+    logger: &Logger,
+    firehose_networks: &FirehoseNetworks,
+    store: &Store,
+    logger_factory: &LoggerFactory,
+    metrics_registry: Arc<MetricsRegistry>,
+) -> HashMap<String, FirehoseChain<near::Chain>> {
+    let chains: Vec<_> = firehose_networks
+        .networks
+        .iter()
+        .filter_map(|(chain_id, endpoints)| {
+            store
+                .block_store()
+                .chain_store(chain_id)
+                .map(|chain_store| (chain_id, chain_store, endpoints))
+                .or_else(|| {
+                    error!(
+                        logger,
+                        "No store configured for NEAR chain {}; ignoring this chain", chain_id
+                    );
+                    None
+                })
+        })
+        .map(|(chain_id, chain_store, endpoints)| {
+            (
+                chain_id.clone(),
+                FirehoseChain {
+                    chain: Arc::new(near::Chain::new(
+                        logger_factory.clone(),
+                        chain_id.clone(),
+                        chain_store,
+                        endpoints.clone(),
+                        metrics_registry.clone(),
+                        Arc::new(NearStreamBuilder {}),
+                    )),
+                    firehose_endpoints: endpoints.clone(),
+                },
+            )
+        })
+        .collect();
+
+    for (chain_id, firehose_chain) in chains.iter() {
         blockchain_map
-            .insert::<graph_chain_near::Chain>(network_name.clone(), firehose_chain.chain.clone())
+            .insert::<graph_chain_near::Chain>(chain_id.clone(), firehose_chain.chain.clone())
     }
 
     HashMap::from_iter(chains)
@@ -544,15 +788,10 @@ fn near_networks_as_chains(
 
 fn start_block_ingestor(
     logger: &Logger,
+    logger_factory: &LoggerFactory,
     block_polling_interval: Duration,
     chains: HashMap<String, Arc<ethereum::Chain>>,
 ) {
-    // BlockIngestor must be configured to keep at least REORG_THRESHOLD ancestors,
-    // otherwise BlockStream will not work properly.
-    // BlockStream expects the blocks after the reorg threshold to be present in the
-    // database.
-    assert!(*ANCESTOR_COUNT >= *REORG_THRESHOLD);
-
     info!(
         logger,
         "Starting block ingestors with {} chains [{}]",
@@ -580,8 +819,26 @@ fn start_block_ingestor(
                 "network_name" => &network_name
             );
 
-            let block_ingestor = BlockIngestor::<ethereum::Chain>::new(
-                chain.ingestor_adapter(),
+            let eth_adapter = chain.cheapest_adapter();
+                let logger = logger_factory
+                    .component_logger(
+                        "BlockIngestor",
+                        Some(ComponentLoggerConfig {
+                            elastic: Some(ElasticComponentLoggerConfig {
+                                index: String::from("block-ingestor-logs"),
+                            }),
+                        }),
+                    )
+                    .new(o!("provider" => eth_adapter.provider().to_string()));
+
+            // The block ingestor must be configured to keep at least REORG_THRESHOLD ancestors,
+            // because the json-rpc BlockStream expects blocks after the reorg threshold to be
+            // present in the DB.
+            let block_ingestor = EthereumBlockIngestor::new(
+                logger,
+                ethereum::ENV_VARS.reorg_threshold,
+                eth_adapter,
+                chain.chain_store(),
                 block_polling_interval,
             )
             .expect("failed to create Ethereum block ingestor");
@@ -594,7 +851,7 @@ fn start_block_ingestor(
 #[derive(Clone)]
 struct FirehoseChain<C: Blockchain> {
     chain: Arc<C>,
-    firehose_endpoints: FirehoseNetworkEndpoints,
+    firehose_endpoints: FirehoseEndpoints,
 }
 
 fn start_firehose_block_ingestor<C, M>(

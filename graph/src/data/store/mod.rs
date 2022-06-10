@@ -1,13 +1,15 @@
 use crate::{
     components::store::{DeploymentLocator, EntityType},
-    prelude::{q, r, s, CacheWeight, EntityKey, QueryExecutionError},
+    data::graphql::ObjectTypeExt,
+    prelude::{anyhow::Context, q, r, s, CacheWeight, EntityKey, QueryExecutionError, Schema},
+    runtime::gas::{Gas, GasSizeOf},
 };
 use crate::{data::subgraph::DeploymentHash, prelude::EntityChange};
 use anyhow::{anyhow, Error};
 use itertools::Itertools;
 use serde::de;
 use serde::{Deserialize, Serialize};
-use stable_hash::prelude::*;
+use stable_hash::{FieldAddress, StableHash, StableHasher};
 use std::convert::TryFrom;
 use std::fmt;
 use std::iter::FromIterator;
@@ -18,6 +20,8 @@ use std::{
 };
 use strum::AsStaticRef as _;
 use strum_macros::AsStaticStr;
+
+use super::graphql::{ext::DirectiveFinder, DocumentExt as _, TypeExt as _};
 
 /// Custom scalars in GraphQL.
 pub mod scalar;
@@ -171,7 +175,7 @@ impl ValueType {
 
 // Note: Do not modify fields without also making a backward compatible change to the StableHash impl (below)
 /// An attribute value is represented as an enum with variants for all supported value types.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "data")]
 #[derive(AsStaticStr)]
 pub enum Value {
@@ -185,29 +189,94 @@ pub enum Value {
     BigInt(scalar::BigInt),
 }
 
-impl StableHash for Value {
-    fn stable_hash<H: StableHasher>(&self, mut sequence_number: H::Seq, state: &mut H) {
+impl stable_hash_legacy::StableHash for Value {
+    fn stable_hash<H: stable_hash_legacy::StableHasher>(
+        &self,
+        mut sequence_number: H::Seq,
+        state: &mut H,
+    ) {
+        use stable_hash_legacy::prelude::*;
         use Value::*;
 
         // This is the default, so write nothing.
-        match self {
-            Null => return,
-            _ => {}
+        if self == &Null {
+            return;
         }
-
-        self.as_static()
-            .stable_hash(sequence_number.next_child(), state);
+        stable_hash_legacy::StableHash::stable_hash(
+            &self.as_static().to_string(),
+            sequence_number.next_child(),
+            state,
+        );
 
         match self {
             Null => unreachable!(),
-            String(inner) => inner.stable_hash(sequence_number, state),
-            Int(inner) => inner.stable_hash(sequence_number, state),
-            BigDecimal(inner) => inner.stable_hash(sequence_number, state),
-            Bool(inner) => inner.stable_hash(sequence_number, state),
-            List(inner) => inner.stable_hash(sequence_number, state),
-            Bytes(inner) => inner.stable_hash(sequence_number, state),
-            BigInt(inner) => inner.stable_hash(sequence_number, state),
+            String(inner) => {
+                stable_hash_legacy::StableHash::stable_hash(inner, sequence_number, state)
+            }
+            Int(inner) => {
+                stable_hash_legacy::StableHash::stable_hash(inner, sequence_number, state)
+            }
+            BigDecimal(inner) => {
+                stable_hash_legacy::StableHash::stable_hash(inner, sequence_number, state)
+            }
+            Bool(inner) => {
+                stable_hash_legacy::StableHash::stable_hash(inner, sequence_number, state)
+            }
+            List(inner) => {
+                stable_hash_legacy::StableHash::stable_hash(inner, sequence_number, state)
+            }
+            Bytes(inner) => {
+                stable_hash_legacy::StableHash::stable_hash(inner, sequence_number, state)
+            }
+            BigInt(inner) => {
+                stable_hash_legacy::StableHash::stable_hash(inner, sequence_number, state)
+            }
         }
+    }
+}
+
+impl StableHash for Value {
+    fn stable_hash<H: StableHasher>(&self, field_address: H::Addr, state: &mut H) {
+        use Value::*;
+
+        // This is the default, so write nothing.
+        if self == &Null {
+            return;
+        }
+
+        let variant = match self {
+            Null => unreachable!(),
+            String(inner) => {
+                inner.stable_hash(field_address.child(0), state);
+                1
+            }
+            Int(inner) => {
+                inner.stable_hash(field_address.child(0), state);
+                2
+            }
+            BigDecimal(inner) => {
+                inner.stable_hash(field_address.child(0), state);
+                3
+            }
+            Bool(inner) => {
+                inner.stable_hash(field_address.child(0), state);
+                4
+            }
+            List(inner) => {
+                inner.stable_hash(field_address.child(0), state);
+                5
+            }
+            Bytes(inner) => {
+                inner.stable_hash(field_address.child(0), state);
+                6
+            }
+            BigInt(inner) => {
+                inner.stable_hash(field_address.child(0), state);
+                7
+            }
+        };
+
+        state.write(field_address, &[variant])
     }
 }
 
@@ -275,9 +344,9 @@ impl Value {
         matches!(self, Value::String(_))
     }
 
-    pub fn as_int(self) -> Option<i32> {
+    pub fn as_int(&self) -> Option<i32> {
         if let Value::Int(i) = self {
-            Some(i)
+            Some(*i)
         } else {
             None
         }
@@ -342,6 +411,22 @@ impl Value {
             Value::String(_) => "String".to_owned(),
         }
     }
+
+    pub fn is_assignable(&self, scalar_type: &ValueType, is_list: bool) -> bool {
+        match (self, scalar_type) {
+            (Value::String(_), ValueType::String)
+            | (Value::BigDecimal(_), ValueType::BigDecimal)
+            | (Value::BigInt(_), ValueType::BigInt)
+            | (Value::Bool(_), ValueType::Boolean)
+            | (Value::Bytes(_), ValueType::Bytes)
+            | (Value::Int(_), ValueType::Int)
+            | (Value::Null, _) => true,
+            (Value::List(values), _) if is_list => values
+                .iter()
+                .all(|value| value.is_assignable(scalar_type, false)),
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for Value {
@@ -361,6 +446,21 @@ impl fmt::Display for Value {
                 Value::BigInt(ref number) => number.to_string(),
             }
         )
+    }
+}
+
+impl fmt::Debug for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::String(s) => f.debug_tuple("String").field(s).finish(),
+            Self::Int(i) => f.debug_tuple("Int").field(i).finish(),
+            Self::BigDecimal(d) => d.fmt(f),
+            Self::Bool(arg0) => f.debug_tuple("Bool").field(arg0).finish(),
+            Self::List(arg0) => f.debug_tuple("List").field(arg0).finish(),
+            Self::Null => write!(f, "Null"),
+            Self::Bytes(bytes) => bytes.fmt(f),
+            Self::BigInt(number) => number.fmt(f),
+        }
     }
 }
 
@@ -492,10 +592,21 @@ where
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct Entity(HashMap<Attribute, Value>);
 
-impl StableHash for Entity {
+impl stable_hash_legacy::StableHash for Entity {
     #[inline]
-    fn stable_hash<H: StableHasher>(&self, mut sequence_number: H::Seq, state: &mut H) {
-        self.0.stable_hash(sequence_number.next_child(), state);
+    fn stable_hash<H: stable_hash_legacy::StableHasher>(
+        &self,
+        mut sequence_number: H::Seq,
+        state: &mut H,
+    ) {
+        use stable_hash_legacy::SequenceNumber;
+        stable_hash_legacy::StableHash::stable_hash(&self.0, sequence_number.next_child(), state);
+    }
+}
+
+impl StableHash for Entity {
+    fn stable_hash<H: StableHasher>(&self, field_address: H::Addr, state: &mut H) {
+        StableHash::stable_hash(&self.0, field_address.child(0), state);
     }
 }
 
@@ -544,11 +655,15 @@ impl Entity {
         v
     }
 
-    /// Try to get this entity's ID
+    /// Return the ID of this entity. If the ID is a string, return the
+    /// string. If it is `Bytes`, return it as a hex string with a `0x`
+    /// prefix. If the ID is not set or anything but a `String` or `Bytes`,
+    /// return an error
     pub fn id(&self) -> Result<String, Error> {
         match self.get("id") {
             None => Err(anyhow!("Entity is missing an `id` attribute")),
             Some(Value::String(s)) => Ok(s.to_owned()),
+            Some(Value::Bytes(b)) => Ok(b.to_string()),
             _ => Err(anyhow!("Entity has non-string `id` attribute")),
         }
     }
@@ -581,6 +696,136 @@ impl Entity {
                 _ => self.insert(key, value),
             };
         }
+    }
+
+    /// Validate that this entity matches the object type definition in the
+    /// schema. An entity that passes these checks can be stored
+    /// successfully in the subgraph's database schema
+    pub fn validate(&self, schema: &Schema, key: &EntityKey) -> Result<(), anyhow::Error> {
+        fn scalar_value_type(schema: &Schema, field_type: &s::Type) -> ValueType {
+            use s::TypeDefinition as t;
+            match field_type {
+                s::Type::NamedType(name) => ValueType::from_str(name).unwrap_or_else(|_| {
+                    match schema.document.get_named_type(name) {
+                        Some(t::Object(obj_type)) => {
+                            let id = obj_type.field("id").expect("all object types have an id");
+                            scalar_value_type(schema, &id.field_type)
+                        }
+                        Some(t::Interface(intf)) => {
+                            // Validation checks that all implementors of an
+                            // interface use the same type for `id`. It is
+                            // therefore enough to use the id type of one of
+                            // the implementors
+                            match schema
+                                .types_for_interface()
+                                .get(&EntityType::new(intf.name.clone()))
+                                .expect("interface type names are known")
+                                .first()
+                            {
+                                None => {
+                                    // Nothing is implementing this interface; we assume it's of type string
+                                    // see also: id-type-for-unimplemented-interfaces
+                                    ValueType::String
+                                }
+                                Some(obj_type) => {
+                                    let id =
+                                        obj_type.field("id").expect("all object types have an id");
+                                    scalar_value_type(schema, &id.field_type)
+                                }
+                            }
+                        }
+                        Some(t::Enum(_)) => ValueType::String,
+                        Some(t::Scalar(_)) => unreachable!("user-defined scalars are not used"),
+                        Some(t::Union(_)) => unreachable!("unions are not used"),
+                        Some(t::InputObject(_)) => unreachable!("inputObjects are not used"),
+                        None => unreachable!("names of field types have been validated"),
+                    }
+                }),
+                s::Type::NonNullType(inner) => scalar_value_type(schema, inner),
+                s::Type::ListType(inner) => scalar_value_type(schema, inner),
+            }
+        }
+
+        if key.entity_type.is_poi() {
+            // Users can't modify Poi entities, and therefore they do not
+            // need to be validated. In addition, the schema has no object
+            // type for them, and validation would therefore fail
+            return Ok(());
+        }
+        let object_type_definitions = schema.document.get_object_type_definitions();
+        let object_type = object_type_definitions
+            .iter()
+            .find(|object_type| key.entity_type.as_str() == object_type.name)
+            .with_context(|| {
+                format!(
+                    "Entity {}[{}]: unknown entity type `{}`",
+                    key.entity_type, key.entity_id, key.entity_type
+                )
+            })?;
+
+        for field in &object_type.fields {
+            let is_derived = field.is_derived();
+            match (self.get(&field.name), is_derived) {
+                (Some(value), false) => {
+                    let scalar_type = scalar_value_type(schema, &field.field_type);
+                    if field.field_type.is_list() {
+                        // Check for inhomgeneous lists to produce a better
+                        // error message for them; other problems, like
+                        // assigning a scalar to a list will be caught below
+                        if let Value::List(elts) = value {
+                            for (index, elt) in elts.iter().enumerate() {
+                                if !elt.is_assignable(&scalar_type, false) {
+                                    anyhow::bail!(
+                                        "Entity {}[{}]: field `{}` is of type {}, but the value `{}` \
+                                        contains a {} at index {}",
+                                        key.entity_type,
+                                        key.entity_id,
+                                        field.name,
+                                        &field.field_type,
+                                        value,
+                                        elt.type_name(),
+                                        index
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if !value.is_assignable(&scalar_type, field.field_type.is_list()) {
+                        anyhow::bail!(
+                            "Entity {}[{}]: the value `{}` for field `{}` must have type {} but has type {}",
+                            key.entity_type,
+                            key.entity_id,
+                            value,
+                            field.name,
+                            &field.field_type,
+                            value.type_name()
+                        );
+                    }
+                }
+                (None, false) => {
+                    if field.field_type.is_non_null() {
+                        anyhow::bail!(
+                            "Entity {}[{}]: missing value for non-nullable field `{}`",
+                            key.entity_type,
+                            key.entity_id,
+                            field.name,
+                        );
+                    }
+                }
+                (Some(_), true) => {
+                    anyhow::bail!(
+                        "Entity {}[{}]: field `{}` is derived and can not be set",
+                        key.entity_type,
+                        key.entity_id,
+                        field.name,
+                    );
+                }
+                (None, true) => {
+                    // derived fields should not be set
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -619,6 +864,12 @@ impl<'a> From<Vec<(&'a str, Value)>> for Entity {
 impl CacheWeight for Entity {
     fn indirect_weight(&self) -> usize {
         self.0.indirect_weight()
+    }
+}
+
+impl GasSizeOf for Entity {
+    fn gas_size_of(&self) -> Gas {
+        self.0.gas_size_of()
     }
 }
 
@@ -662,4 +913,131 @@ fn value_bigint() {
         Value::BigInt(FromStr::from_str(big_num).unwrap())
     );
     assert_eq!(r::Value::from(from_query), graphql_value);
+}
+
+#[test]
+fn entity_validation() {
+    fn make_thing(name: &str) -> Entity {
+        let mut thing = Entity::new();
+        thing.set("id", name);
+        thing.set("name", name);
+        thing.set("stuff", "less");
+        thing.set("favorite_color", "red");
+        thing.set("things", Value::List(vec![]));
+        thing
+    }
+
+    fn check(thing: Entity, errmsg: &str) {
+        const DOCUMENT: &str = "
+      enum Color { red, yellow, blue }
+      interface Stuff { id: ID!, name: String! }
+      type Cruft @entity {
+          id: ID!,
+          thing: Thing!
+      }
+      type Thing @entity {
+          id: ID!,
+          name: String!,
+          favorite_color: Color,
+          stuff: Stuff,
+          things: [Thing!]!
+          # Make sure we do not validate derived fields; it's ok
+          # to store a thing with a null Cruft
+          cruft: Cruft! @derivedFrom(field: \"thing\")
+      }";
+        let subgraph = DeploymentHash::new("doesntmatter").unwrap();
+        let schema =
+            crate::prelude::Schema::parse(DOCUMENT, subgraph).expect("Failed to parse test schema");
+        let id = thing.id().unwrap_or("none".to_owned());
+        let key = EntityKey::data(
+            DeploymentHash::new("doesntmatter").unwrap(),
+            "Thing".to_owned(),
+            id.to_owned(),
+        );
+
+        let err = thing.validate(&schema, &key);
+        if errmsg == "" {
+            assert!(
+                err.is_ok(),
+                "checking entity {}: expected ok but got {}",
+                id,
+                err.unwrap_err()
+            );
+        } else {
+            if let Err(e) = err {
+                assert_eq!(errmsg, e.to_string(), "checking entity {}", id);
+            } else {
+                panic!(
+                    "Expected error `{}` but got ok when checking entity {}",
+                    errmsg, id
+                );
+            }
+        }
+    }
+
+    let mut thing = make_thing("t1");
+    thing.set("things", Value::from(vec!["thing1", "thing2"]));
+    check(thing, "");
+
+    let thing = make_thing("t2");
+    check(thing, "");
+
+    let mut thing = make_thing("t3");
+    thing.remove("name");
+    check(
+        thing,
+        "Entity Thing[t3]: missing value for non-nullable field `name`",
+    );
+
+    let mut thing = make_thing("t4");
+    thing.remove("things");
+    check(
+        thing,
+        "Entity Thing[t4]: missing value for non-nullable field `things`",
+    );
+
+    let mut thing = make_thing("t5");
+    thing.set("name", Value::Int(32));
+    check(
+        thing,
+        "Entity Thing[t5]: the value `32` for field `name` must \
+         have type String! but has type Int",
+    );
+
+    let mut thing = make_thing("t6");
+    thing.set("things", Value::List(vec!["thing1".into(), 17.into()]));
+    check(
+        thing,
+        "Entity Thing[t6]: field `things` is of type [Thing!]!, \
+         but the value `[thing1, 17]` contains a Int at index 1",
+    );
+
+    let mut thing = make_thing("t7");
+    thing.remove("favorite_color");
+    thing.remove("stuff");
+    check(thing, "");
+
+    let mut thing = make_thing("t8");
+    thing.set("cruft", "wat");
+    check(
+        thing,
+        "Entity Thing[t8]: field `cruft` is derived and can not be set",
+    );
+}
+
+#[test]
+fn fmt_debug() {
+    assert_eq!("String(\"hello\")", format!("{:?}", Value::from("hello")));
+    assert_eq!("Int(17)", format!("{:?}", Value::Int(17)));
+    assert_eq!("Bool(false)", format!("{:?}", Value::Bool(false)));
+    assert_eq!("Null", format!("{:?}", Value::Null));
+
+    let bd = Value::BigDecimal(scalar::BigDecimal::from(-0.17));
+    assert_eq!("BigDecimal(-0.17)", format!("{:?}", bd));
+
+    let bytes = Value::Bytes(scalar::Bytes::from([222, 173, 190, 239].as_slice()));
+    assert_eq!("Bytes(0xdeadbeef)", format!("{:?}", bytes));
+
+    let bi = Value::BigInt(scalar::BigInt::from(-17i32));
+    assert_eq!("BigInt(-17)", format!("{:?}", bi));
 }

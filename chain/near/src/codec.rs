@@ -1,5 +1,6 @@
+#[rustfmt::skip]
 #[path = "protobuf/sf.near.codec.v1.rs"]
-mod pbcodec;
+pub mod pbcodec;
 
 use graph::{
     blockchain::Block as BlockchainBlock,
@@ -26,7 +27,7 @@ impl LowerHex for &CryptoHash {
 impl BlockHeader {
     pub fn parent_ptr(&self) -> Option<BlockPtr> {
         match (self.prev_hash.as_ref(), self.prev_height) {
-            (Some(hash), number) => Some(BlockPtr::from((hash.into(), number))),
+            (Some(hash), number) => Some(BlockPtr::from((H256::from(hash), number))),
             _ => None,
         }
     }
@@ -34,7 +35,7 @@ impl BlockHeader {
 
 impl<'a> From<&'a BlockHeader> for BlockPtr {
     fn from(b: &'a BlockHeader) -> BlockPtr {
-        BlockPtr::from((b.hash.as_ref().unwrap().into(), b.height))
+        BlockPtr::from((H256::from(b.hash.as_ref().unwrap()), b.height))
     }
 }
 
@@ -43,14 +44,12 @@ impl Block {
         self.header.as_ref().unwrap()
     }
 
+    pub fn ptr(&self) -> BlockPtr {
+        BlockPtr::from(self.header())
+    }
+
     pub fn parent_ptr(&self) -> Option<BlockPtr> {
         self.header().parent_ptr()
-    }
-}
-
-impl From<Block> for BlockPtr {
-    fn from(b: Block) -> BlockPtr {
-        (&b).into()
     }
 }
 

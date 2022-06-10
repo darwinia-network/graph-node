@@ -11,7 +11,6 @@ use graph::{
     },
     semver,
 };
-use std::collections::BTreeMap;
 use std::{convert::TryFrom, sync::Arc};
 
 use crate::chain::Chain;
@@ -43,7 +42,7 @@ impl blockchain::DataSource<Chain> for DataSource {
     fn match_and_decode(
         &self,
         trigger: &<Chain as Blockchain>::TriggerData,
-        block: Arc<<Chain as Blockchain>::Block>,
+        block: &Arc<<Chain as Blockchain>::Block>,
         _logger: &Logger,
     ) -> Result<Option<TriggerWithHandler<Chain>>, Error> {
         if self.source.start_block > block.number() {
@@ -128,7 +127,7 @@ impl blockchain::DataSource<Chain> for DataSource {
     }
 
     fn from_stored_dynamic_data_source(
-        _templates: &BTreeMap<&str, &DataSourceTemplate>,
+        _template: &DataSourceTemplate,
         _stored: StoredDynamicDataSource,
     ) -> Result<Self, Error> {
         // FIXME (NEAR): Implement me correctly
@@ -219,7 +218,7 @@ pub struct UnresolvedDataSource {
 impl blockchain::UnresolvedDataSource<Chain> for UnresolvedDataSource {
     async fn resolve(
         self,
-        resolver: &impl LinkResolver,
+        resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
     ) -> Result<DataSource, Error> {
         let UnresolvedDataSource {
@@ -231,9 +230,9 @@ impl blockchain::UnresolvedDataSource<Chain> for UnresolvedDataSource {
             context,
         } = self;
 
-        info!(logger, "Resolve data source"; "name" => &name, "source" => &source.start_block);
+        info!(logger, "Resolve data source"; "name" => &name, "source_account" => format_args!("{:?}", source.account), "source_start_block" => source.start_block);
 
-        let mapping = mapping.resolve(&*resolver, logger).await?;
+        let mapping = mapping.resolve(resolver, logger).await?;
 
         DataSource::from_manifest(kind, network, name, source, mapping, context)
     }
@@ -293,7 +292,7 @@ pub type DataSourceTemplate = BaseDataSourceTemplate<Mapping>;
 impl blockchain::UnresolvedDataSourceTemplate<Chain> for UnresolvedDataSourceTemplate {
     async fn resolve(
         self,
-        resolver: &impl LinkResolver,
+        resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
     ) -> Result<DataSourceTemplate, Error> {
         let UnresolvedDataSourceTemplate {
@@ -344,7 +343,7 @@ pub struct UnresolvedMapping {
 impl UnresolvedMapping {
     pub async fn resolve(
         self,
-        resolver: &impl LinkResolver,
+        resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
     ) -> Result<Mapping, Error> {
         let UnresolvedMapping {

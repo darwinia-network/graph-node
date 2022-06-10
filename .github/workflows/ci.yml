@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       ipfs:
-        image: ipfs/go-ipfs:v0.4.23
+        image: ipfs/go-ipfs:v0.10.0
         ports:
           - 5001:5001
       postgres:
@@ -65,6 +65,62 @@ jobs:
         with:
           command: test
           args: --verbose --workspace --exclude graph-tests -- --nocapture
+
+  runner-tests:
+    name: Subgraph Runner integration tests
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["stable"]
+    runs-on: ubuntu-latest
+    services:
+      ipfs:
+        image: ipfs/go-ipfs:v0.10.0
+        ports:
+          - 5001:5001
+      postgres:
+        image: postgres
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: graph_node_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v2
+
+      - name: Cache cargo registry
+        uses: actions/cache@v2
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: test-cargo-${{ hashFiles('**/Cargo.toml') }}
+
+      - name: Install rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: ${{ matrix.rust }}
+          override: true
+
+      - name: Install lld
+        run: sudo apt-get install -y lld
+
+      - name: Run runner tests
+        id: runner-tests-1
+        uses: actions-rs/cargo@v1
+        env:
+          RUSTFLAGS: "-C link-arg=-fuse-ld=lld -D warnings"
+          TESTS_GANACHE_HARD_WAIT_SECONDS: "30"
+        with:
+          command: test
+          args: --verbose --package graph-tests -- test_runner --nocapture
 
   integration-tests:
     name: Run integration tests
@@ -119,7 +175,7 @@ jobs:
           TESTS_GANACHE_HARD_WAIT_SECONDS: "30"
         with:
           command: test
-          args: --verbose --package graph-tests -- --nocapture
+          args: --verbose --package graph-tests -- --nocapture --skip test_runner
         continue-on-error: true
       - name: Run integration tests (round 2)
         id: integration-tests-2
@@ -131,7 +187,7 @@ jobs:
           TESTS_GANACHE_HARD_WAIT_SECONDS: "30"
         with:
           command: test
-          args: --verbose --package graph-tests -- --nocapture
+          args: --verbose --package graph-tests -- --nocapture --skip test_runner
 
   rustfmt:
     name: Check rustfmt style
@@ -147,26 +203,46 @@ jobs:
           toolchain: ${{ matrix.rust }}
           components: rustfmt
           override: true
-      - name: Cache cargo registry
-        uses: actions/cache@v2
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: rustfmt-cargo-${{ hashFiles('**/Cargo.toml') }}
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get -y install libpq-dev
-
-      - name: Check formating
+      - name: Check formatting
         uses: actions-rs/cargo@v1
         env:
           RUSTFLAGS: "-D warnings"
         with:
           command: fmt
           args: --all -- --check
+
+  clippy:
+    name: Report Clippy warnings
+    strategy:
+      matrix:
+        rust: ["stable"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: ${{ matrix.rust }}
+          components: clippy
+          override: true
+      # Unlike rustfmt, Clippy actually compiles stuff so it benefits from
+      # caching.
+      - name: Cache cargo registry
+        uses: actions/cache@v2
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: check-cargo-${{ hashFiles('**/Cargo.toml') }}
+
+      - name: Run Clippy
+        uses: actions-rs/cargo@v1
+        # We do *not* block builds if Clippy complains. It's just here to let us
+        # keep an eye out on the warnings it produces.
+        continue-on-error: true
+        with:
+          command: clippy
 
   release-check:
     name: Build in release mode
@@ -209,3 +285,17 @@ jobs:
         with:
           command: check
           args: --release
+
+  version-check:
+    name: Check that all graph-node crates have the same version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Checks through all Cargo.toml files, making sure their version is unique
+        run: |
+          source 'scripts/toml-utils.sh'
+
+          ALL_TOML_FILE_NAMES=$(get_all_toml_files)
+          ALL_TOML_VERSIONS=$(get_all_toml_versions $ALL_TOML_FILE_NAMES)
+
+          ./scripts/lines-unique.sh $ALL_TOML_VERSIONS

@@ -8,13 +8,12 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use super::block_stream::{
-    BlockStream, BlockStreamEvent, BlockStreamMetrics, BlockWithTriggers, ChainHeadUpdateStream,
-    FirehoseCursor, TriggersAdapter,
+    BlockStream, BlockStreamEvent, BlockWithTriggers, ChainHeadUpdateStream, FirehoseCursor,
+    TriggersAdapter,
 };
 use super::{Block, BlockPtr, Blockchain};
 
 use crate::components::store::BlockNumber;
-use crate::components::store::WritableStore;
 use crate::data::subgraph::UnifiedMappingApiVersion;
 use crate::prelude::*;
 #[cfg(debug_assertions)]
@@ -62,10 +61,9 @@ enum ReconciliationStep<C>
 where
     C: Blockchain,
 {
-    /// Revert(from, to) the current block pointed at by the subgraph pointer. The pointer is to the current
-    /// subgraph head, and a single block will be reverted so the new head will be the parent of the
-    /// current one. The second BlockPtr is the parent.
-    Revert(BlockPtr, BlockPtr),
+    /// Revert(to) the block the subgraph should be reverted to, so it becomes the new subgraph
+    /// head.
+    Revert(BlockPtr),
 
     /// Move forwards, processing one or more blocks. Second element is the block range size.
     ProcessDescendantBlocks(Vec<BlockWithTriggers<C>>, BlockNumber),
@@ -82,9 +80,8 @@ struct PollingBlockStreamContext<C>
 where
     C: Blockchain,
 {
-    subgraph_store: Arc<dyn WritableStore>,
     chain_store: Arc<dyn ChainStore>,
-    adapter: Arc<C::TriggersAdapter>,
+    adapter: Arc<dyn TriggersAdapter<C>>,
     node_id: NodeId,
     subgraph_id: DeploymentHash,
     // This is not really a block number, but the (unsigned) difference
@@ -93,7 +90,6 @@ where
     filter: Arc<C::TriggerFilter>,
     start_blocks: Vec<BlockNumber>,
     logger: Logger,
-    metrics: Arc<BlockStreamMetrics>,
     previous_triggers_per_block: f64,
     // Not a BlockNumber, but the difference between two block numbers
     previous_block_range_size: BlockNumber,
@@ -107,7 +103,6 @@ where
 impl<C: Blockchain> Clone for PollingBlockStreamContext<C> {
     fn clone(&self) -> Self {
         Self {
-            subgraph_store: self.subgraph_store.cheap_clone(),
             chain_store: self.chain_store.cheap_clone(),
             adapter: self.adapter.clone(),
             node_id: self.node_id.clone(),
@@ -116,7 +111,6 @@ impl<C: Blockchain> Clone for PollingBlockStreamContext<C> {
             filter: self.filter.clone(),
             start_blocks: self.start_blocks.clone(),
             logger: self.logger.clone(),
-            metrics: self.metrics.clone(),
             previous_triggers_per_block: self.previous_triggers_per_block,
             previous_block_range_size: self.previous_block_range_size,
             max_block_range_size: self.max_block_range_size,
@@ -142,9 +136,8 @@ where
     /// Blocks and range size
     Blocks(VecDeque<BlockWithTriggers<C>>, BlockNumber),
 
-    // The payload is the current subgraph head pointer, which should be reverted and it's parent, such that the
-    // parent of the current subgraph head becomes the new subgraph head.
-    Revert(BlockPtr, BlockPtr),
+    // The payload is block the subgraph should be reverted to, so it becomes the new subgraph head.
+    Revert(BlockPtr),
     Done,
 }
 
@@ -153,17 +146,15 @@ where
     C: Blockchain,
 {
     pub fn new(
-        subgraph_store: Arc<dyn WritableStore>,
         chain_store: Arc<dyn ChainStore>,
         chain_head_update_stream: ChainHeadUpdateStream,
-        adapter: Arc<C::TriggersAdapter>,
+        adapter: Arc<dyn TriggersAdapter<C>>,
         node_id: NodeId,
         subgraph_id: DeploymentHash,
         filter: Arc<C::TriggerFilter>,
         start_blocks: Vec<BlockNumber>,
         reorg_threshold: BlockNumber,
         logger: Logger,
-        metrics: Arc<BlockStreamMetrics>,
         max_block_range_size: BlockNumber,
         target_triggers_per_block_range: u64,
         unified_api_version: UnifiedMappingApiVersion,
@@ -175,7 +166,6 @@ where
             chain_head_update_stream,
             ctx: PollingBlockStreamContext {
                 current_block: start_block,
-                subgraph_store,
                 chain_store,
                 adapter,
                 node_id,
@@ -184,7 +174,6 @@ where
                 logger,
                 filter,
                 start_blocks,
-                metrics,
                 previous_triggers_per_block: STARTING_PREVIOUS_TRIGGERS_PER_BLOCK,
                 previous_block_range_size: 1,
                 max_block_range_size,
@@ -215,12 +204,11 @@ where
                     continue;
                 }
                 ReconciliationStep::Done => {
-                    // Reconciliation is complete, so try to mark subgraph as Synced
-                    ctx.update_subgraph_synced_status()?;
-
                     return Ok(NextBlocks::Done);
                 }
-                ReconciliationStep::Revert(from, to) => return Ok(NextBlocks::Revert(from, to)),
+                ReconciliationStep::Revert(parent_ptr) => {
+                    return Ok(NextBlocks::Revert(parent_ptr))
+                }
             }
         }
     }
@@ -232,7 +220,7 @@ where
         let max_block_range_size = self.max_block_range_size;
 
         // Get pointers from database for comparison
-        let head_ptr_opt = ctx.chain_store.chain_head_ptr()?;
+        let head_ptr_opt = ctx.chain_store.chain_head_ptr().await?;
         let subgraph_ptr = self.current_block.clone();
 
         // If chain head ptr is not set yet
@@ -265,8 +253,6 @@ where
             if ptr.number >= head_ptr.number {
                 return Ok(ReconciliationStep::Done);
             }
-
-            self.metrics.deployment_head.set(ptr.number as f64);
         }
 
         // Subgraph ptr is behind head ptr.
@@ -324,7 +310,7 @@ where
                 let from = subgraph_ptr.unwrap();
                 let parent = self.parent_ptr(&from).await?;
 
-                return Ok(ReconciliationStep::Revert(from, parent));
+                return Ok(ReconciliationStep::Revert(parent));
             }
 
             // The subgraph ptr points to a block on the main chain.
@@ -388,7 +374,6 @@ where
             };
             let to = cmp::min(from + range_size - 1, to_limit);
 
-            let section = ctx.metrics.stopwatch.start_section("scan_blocks");
             info!(
                 ctx.logger,
                 "Scanning blocks [{}, {}]", from, to;
@@ -397,7 +382,6 @@ where
 
             let blocks = self.adapter.scan_triggers(from, to, &self.filter).await?;
 
-            section.end();
             Ok(ReconciliationStep::ProcessDescendantBlocks(
                 blocks, range_size,
             ))
@@ -430,7 +414,7 @@ where
             #[cfg(debug_assertions)]
             if test_reorg(subgraph_ptr.clone()) {
                 let parent = self.parent_ptr(&subgraph_ptr).await?;
-                return Ok(ReconciliationStep::Revert(subgraph_ptr.clone(), parent));
+                return Ok(ReconciliationStep::Revert(parent));
             }
 
             // Precondition: subgraph_ptr.number < head_ptr.number
@@ -439,7 +423,7 @@ where
 
             // In principle this block should be in the store, but we have seen this error for deep
             // reorgs in ropsten.
-            let head_ancestor_opt = self.adapter.ancestor_block(head_ptr, offset)?;
+            let head_ancestor_opt = self.adapter.ancestor_block(head_ptr, offset).await?;
 
             match head_ancestor_opt {
                 None => {
@@ -470,7 +454,7 @@ where
                         // The subgraph ptr is not on the main chain.
                         // We will need to step back (possibly repeatedly) one block at a time
                         // until we are back on the main chain.
-                        Ok(ReconciliationStep::Revert(subgraph_ptr, parent))
+                        Ok(ReconciliationStep::Revert(parent))
                     }
                 }
             }
@@ -485,25 +469,6 @@ where
             .expect("genesis block can't be reverted");
 
         Ok(ptr)
-    }
-
-    /// Set subgraph deployment entity synced flag if and only if the subgraph block pointer is
-    /// caught up to the head block pointer.
-    fn update_subgraph_synced_status(&self) -> Result<(), StoreError> {
-        let head_ptr_opt = self.chain_store.chain_head_ptr()?;
-        let subgraph_ptr = self.current_block.clone();
-
-        if head_ptr_opt != subgraph_ptr || head_ptr_opt.is_none() || subgraph_ptr.is_none() {
-            // Not synced yet
-            Ok(())
-        } else {
-            // Synced
-
-            // Stop recording time-to-sync metrics.
-            self.metrics.stopwatch.disable();
-
-            self.subgraph_store.deployment_synced()
-        }
     }
 }
 
@@ -567,14 +532,13 @@ impl<C: Blockchain> Stream for PollingBlockStream<C> {
                                 // Poll for chain head update
                                 continue;
                             }
-                            NextBlocks::Revert(from, to) => {
-                                self.ctx.current_block = to.into();
+                            NextBlocks::Revert(parent_ptr) => {
+                                self.ctx.current_block = Some(parent_ptr.clone());
 
                                 self.state = BlockStreamState::BeginReconciliation;
                                 break Poll::Ready(Some(Ok(BlockStreamEvent::Revert(
-                                    from,
+                                    parent_ptr,
                                     FirehoseCursor::None,
-                                    self.ctx.current_block.clone(),
                                 ))));
                             }
                         },

@@ -1,6 +1,7 @@
 use ethabi::Contract;
 use graph::components::store::DeploymentLocator;
 use graph::data::subgraph::*;
+use graph::env::EnvVars;
 use graph::ipfs_client::IpfsClient;
 use graph::log;
 use graph::prelude::*;
@@ -50,13 +51,17 @@ fn mock_host_exports(
     }];
 
     let network = data_source.network.clone().unwrap();
+    let ens_lookup = store.ens_lookup();
     HostExports::new(
         subgraph_id,
         &data_source,
         network,
         Arc::new(templates),
-        Arc::new(graph_core::LinkResolver::from(IpfsClient::localhost())),
-        store,
+        Arc::new(graph_core::LinkResolver::new(
+            vec![IpfsClient::localhost()],
+            Arc::new(EnvVars::default()),
+        )),
+        ens_lookup,
     )
 }
 
@@ -105,6 +110,7 @@ pub fn mock_context(
         ),
         proof_of_indexing: None,
         host_fns: Arc::new(Vec::new()),
+        debug_fork: None,
     }
 }
 
@@ -115,11 +121,8 @@ pub fn mock_data_source(path: &str, api_version: Version) -> DataSource {
         kind: String::from("ethereum/contract"),
         name: String::from("example data source"),
         network: Some(String::from("mainnet")),
-        source: Source {
-            address: Some(Address::from_str("0123123123012312312301231231230123123123").unwrap()),
-            abi: String::from("123123"),
-            start_block: 0,
-        },
+        address: Some(Address::from_str("0123123123012312312301231231230123123123").unwrap()),
+        start_block: 0,
         mapping: Mapping {
             kind: String::from("ethereum/events"),
             api_version,
