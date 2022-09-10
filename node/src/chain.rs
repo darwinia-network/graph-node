@@ -152,6 +152,7 @@ pub async fn create_ethereum_networks(
                         )
                         .await,
                     ),
+                    web3.limit_for(&config.node),
                 );
             }
         }
@@ -160,11 +161,51 @@ pub async fn create_ethereum_networks(
     Ok(parsed_networks)
 }
 
-pub async fn create_firehose_networks(
+pub fn create_substreams_networks(
     logger: Logger,
-    _registry: Arc<dyn MetricsRegistryTrait>,
     config: &Config,
-) -> Result<BTreeMap<BlockchainKind, FirehoseNetworks>, anyhow::Error> {
+) -> BTreeMap<BlockchainKind, FirehoseNetworks> {
+    debug!(
+        logger,
+        "Creating firehose networks [{} chains, ingestor {}]",
+        config.chains.chains.len(),
+        config.chains.ingestor,
+    );
+
+    let mut networks_by_kind = BTreeMap::new();
+
+    for (name, chain) in &config.chains.chains {
+        for provider in &chain.providers {
+            if let ProviderDetails::Substreams(ref firehose) = provider.details {
+                info!(
+                    logger,
+                    "Configuring firehose endpoint";
+                    "provider" => &provider.label,
+                );
+
+                let endpoint = FirehoseEndpoint::new(
+                    &provider.label,
+                    &firehose.url,
+                    firehose.token.clone(),
+                    firehose.filters_enabled(),
+                    firehose.conn_pool_size,
+                );
+
+                let parsed_networks = networks_by_kind
+                    .entry(chain.protocol)
+                    .or_insert_with(|| FirehoseNetworks::new());
+                parsed_networks.insert(name.to_string(), Arc::new(endpoint));
+            }
+        }
+    }
+
+    networks_by_kind
+}
+
+pub fn create_firehose_networks(
+    logger: Logger,
+    config: &Config,
+) -> BTreeMap<BlockchainKind, FirehoseNetworks> {
     debug!(
         logger,
         "Creating firehose networks [{} chains, ingestor {}]",
@@ -177,21 +218,19 @@ pub async fn create_firehose_networks(
     for (name, chain) in &config.chains.chains {
         for provider in &chain.providers {
             if let ProviderDetails::Firehose(ref firehose) = provider.details {
-                let logger = logger.new(o!("provider" => provider.label.clone()));
                 info!(
                     logger,
-                    "Creating firehose endpoint";
-                    "url" => &firehose.url,
+                    "Configuring firehose endpoint";
+                    "provider" => &provider.label,
                 );
 
                 let endpoint = FirehoseEndpoint::new(
-                    logger,
                     &provider.label,
                     &firehose.url,
                     firehose.token.clone(),
                     firehose.filters_enabled(),
-                )
-                .await?;
+                    firehose.conn_pool_size,
+                );
 
                 let parsed_networks = networks_by_kind
                     .entry(chain.protocol)
@@ -201,7 +240,7 @@ pub async fn create_firehose_networks(
         }
     }
 
-    Ok(networks_by_kind)
+    networks_by_kind
 }
 
 /// Try to connect to all the providers in `eth_networks` and get their net
@@ -309,7 +348,7 @@ where
                 let logger = logger.new(o!("provider" => endpoint.provider.to_string()));
                 info!(
                     logger, "Connecting to Firehose to get chain identifier";
-                    "url" => &endpoint.uri,
+                    "provider" => &endpoint.provider,
                 );
                 match tokio::time::timeout(
                     NET_VERSION_WAIT_TIME,
@@ -332,7 +371,7 @@ where
                         info!(
                             logger,
                             "Connected to Firehose";
-                            "uri" => &endpoint.uri,
+                            "provider" => &endpoint.provider,
                             "genesis_block" => format_args!("{}", &ptr),
                         );
 

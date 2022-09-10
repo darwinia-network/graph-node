@@ -3,6 +3,7 @@
 
 use anyhow::{anyhow, Error};
 use graph::constraint_violation;
+use graph::data::query::Trace;
 use graph::data::value::{Object, Word};
 use graph::prelude::{r, CacheWeight};
 use graph::slog::warn;
@@ -24,7 +25,7 @@ use graph::{
 };
 
 use crate::execution::{ast as a, ExecutionContext, Resolver};
-use crate::runner::ResultSizeMetrics;
+use crate::metrics::GraphQLMetrics;
 use crate::schema::ast as sast;
 use crate::store::query::build_query;
 use crate::store::StoreResolver;
@@ -480,10 +481,10 @@ pub fn run(
     resolver: &StoreResolver,
     ctx: &ExecutionContext<impl Resolver>,
     selection_set: &a::SelectionSet,
-    result_size: &ResultSizeMetrics,
-) -> Result<r::Value, Vec<QueryExecutionError>> {
-    execute_root_selection_set(resolver, ctx, selection_set).map(|nodes| {
-        result_size.observe(nodes.weight());
+    graphql_metrics: &GraphQLMetrics,
+) -> Result<(r::Value, Trace), Vec<QueryExecutionError>> {
+    execute_root_selection_set(resolver, ctx, selection_set).map(|(nodes, trace)| {
+        graphql_metrics.observe_query_result_size(nodes.weight());
         let obj = Object::from_iter(
             nodes
                 .into_iter()
@@ -494,7 +495,7 @@ pub fn run(
                 })
                 .flatten(),
         );
-        r::Value::Object(obj)
+        (r::Value::Object(obj), trace)
     })
 }
 
@@ -503,9 +504,10 @@ fn execute_root_selection_set(
     resolver: &StoreResolver,
     ctx: &ExecutionContext<impl Resolver>,
     selection_set: &a::SelectionSet,
-) -> Result<Vec<Node>, Vec<QueryExecutionError>> {
+) -> Result<(Vec<Node>, Trace), Vec<QueryExecutionError>> {
+    let trace = Trace::root(ctx.query.query_text.clone());
     // Execute the root selection set against the root query type
-    execute_selection_set(resolver, ctx, make_root_node(), selection_set)
+    execute_selection_set(resolver, ctx, make_root_node(), trace, selection_set)
 }
 
 fn check_result_size<'a>(
@@ -528,8 +530,9 @@ fn execute_selection_set<'a>(
     resolver: &StoreResolver,
     ctx: &'a ExecutionContext<impl Resolver>,
     mut parents: Vec<Node>,
+    mut parent_trace: Trace,
     selection_set: &a::SelectionSet,
-) -> Result<Vec<Node>, Vec<QueryExecutionError>> {
+) -> Result<(Vec<Node>, Trace), Vec<QueryExecutionError>> {
     let schema = &ctx.query.schema;
     let mut errors: Vec<QueryExecutionError> = Vec::new();
 
@@ -590,13 +593,20 @@ fn execute_selection_set<'a>(
                 field_type,
                 collected_columns,
             ) {
-                Ok(children) => {
-                    match execute_selection_set(resolver, ctx, children, &field.selection_set) {
-                        Ok(children) => {
+                Ok((children, trace)) => {
+                    match execute_selection_set(
+                        resolver,
+                        ctx,
+                        children,
+                        trace,
+                        &field.selection_set,
+                    ) {
+                        Ok((children, trace)) => {
                             Join::perform(&mut parents, children, field.response_key());
                             let weight =
                                 parents.iter().map(|parent| parent.weight()).sum::<usize>();
                             check_result_size(ctx, weight)?;
+                            parent_trace.push(field.response_key(), trace);
                         }
                         Err(mut e) => errors.append(&mut e),
                     }
@@ -609,7 +619,7 @@ fn execute_selection_set<'a>(
     }
 
     if errors.is_empty() {
-        Ok(parents)
+        Ok((parents, parent_trace))
     } else {
         Err(errors)
     }
@@ -624,7 +634,7 @@ fn execute_field(
     field: &a::Field,
     field_definition: &s::Field,
     selected_attrs: SelectedAttributes,
-) -> Result<Vec<Node>, Vec<QueryExecutionError>> {
+) -> Result<(Vec<Node>, Trace), Vec<QueryExecutionError>> {
     let multiplicity = if sast::is_list_or_non_null_list_field(field_definition) {
         ChildMultiplicity::Many
     } else {
@@ -636,6 +646,7 @@ fn execute_field(
         resolver.store.as_ref(),
         parents,
         join,
+        ctx.query.schema.as_ref(),
         field,
         multiplicity,
         ctx.query.schema.types_for_interface(),
@@ -656,6 +667,7 @@ fn fetch(
     store: &(impl QueryStore + ?Sized),
     parents: &[&mut Node],
     join: &Join<'_>,
+    schema: &ApiSchema,
     field: &a::Field,
     multiplicity: ChildMultiplicity,
     types_for_interface: &BTreeMap<EntityType, Vec<s::ObjectType>>,
@@ -664,7 +676,7 @@ fn fetch(
     max_skip: u32,
     query_id: String,
     selected_attrs: SelectedAttributes,
-) -> Result<Vec<Node>, QueryExecutionError> {
+) -> Result<(Vec<Node>, Trace), QueryExecutionError> {
     let mut query = build_query(
         join.child_type,
         block,
@@ -673,6 +685,7 @@ fn fetch(
         max_first,
         max_skip,
         selected_attrs,
+        schema,
     )?;
     query.query_id = Some(query_id);
 
@@ -695,13 +708,16 @@ fn fetch(
         // by the parent list
         let windows = join.windows(parents, multiplicity, &query.collection);
         if windows.is_empty() {
-            return Ok(vec![]);
+            return Ok((vec![], Trace::None));
         }
         query.collection = EntityCollection::Window(windows);
     }
-    store
-        .find_query_values(query)
-        .map(|entities| entities.into_iter().map(|entity| entity.into()).collect())
+    store.find_query_values(query).map(|(values, trace)| {
+        (
+            values.into_iter().map(|entity| entity.into()).collect(),
+            trace,
+        )
+    })
 }
 
 #[derive(Debug, Default, Clone)]

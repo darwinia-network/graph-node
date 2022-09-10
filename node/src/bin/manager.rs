@@ -186,6 +186,13 @@ pub enum Command {
     Copy(CopyCommand),
     /// Run a GraphQL query
     Query {
+        /// Save the JSON query result in this file
+        #[structopt(long, short)]
+        output: Option<String>,
+        /// Save the query trace in this file
+        #[structopt(long, short)]
+        trace: Option<String>,
+
         /// The subgraph to query
         ///
         /// Either a deployment id `Qm..` or a subgraph name
@@ -262,6 +269,16 @@ pub enum ConfigCommand {
         /// Print connections by shard rather than by node
         #[structopt(short, long)]
         shard: bool,
+    },
+    /// Show eligible providers
+    ///
+    /// Prints the providers that can be used for a deployment on a given
+    /// network with the given features. Set the name of the node for which
+    /// to simulate placement with the toplevel `--node-id` option
+    Provider {
+        #[structopt(short, long, default_value = "")]
+        features: String,
+        network: String,
     },
 }
 
@@ -481,6 +498,7 @@ impl From<Opt> for config::Opt {
         let mut config_opt = config::Opt::default();
         config_opt.config = Some(opt.config);
         config_opt.store_connection_pool_size = 5;
+        config_opt.node_id = opt.node_id;
         config_opt
     }
 }
@@ -807,6 +825,12 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Check { print } => commands::config::check(&ctx.config, print),
                 Pools { nodes, shard } => commands::config::pools(&ctx.config, nodes, shard),
+                Provider { features, network } => {
+                    let logger = ctx.logger.clone();
+                    let registry = ctx.registry.clone();
+                    commands::config::provider(logger, &ctx.config, registry, features, network)
+                        .await
+                }
             }
         }
         Remove { name } => commands::remove::run(ctx.subgraph_store(), name),
@@ -836,6 +860,7 @@ async fn main() -> anyhow::Result<()> {
                 force,
                 sleep,
             )
+            .await
         }
         Run {
             network_name,
@@ -904,10 +929,12 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Query {
+            output,
+            trace,
             target,
             query,
             vars,
-        } => commands::query::run(ctx.graphql_runner(), target, query, vars).await,
+        } => commands::query::run(ctx.graphql_runner(), target, query, vars, output, trace).await,
         Chain(cmd) => {
             use ChainCommand::*;
             match cmd {

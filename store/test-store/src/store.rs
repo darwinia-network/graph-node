@@ -7,14 +7,15 @@ use graph::log;
 use graph::prelude::{QueryStoreManager as _, SubgraphStore as _, *};
 use graph::semver::Version;
 use graph::{
-    blockchain::ChainIdentifier, components::store::DeploymentLocator,
+    blockchain::block_stream::FirehoseCursor, blockchain::ChainIdentifier,
+    components::store::DeploymentLocator, components::store::EntityKey,
     components::store::EntityType, components::store::StatusStore,
     components::store::StoredDynamicDataSource, data::subgraph::status, prelude::NodeId,
 };
 use graph_graphql::prelude::{
     execute_query, Query as PreparedQuery, QueryExecutionOptions, StoreResolver,
 };
-use graph_graphql::test_support::ResultSizeMetrics;
+use graph_graphql::test_support::GraphQLMetrics;
 use graph_mock::MockMetricsRegistry;
 use graph_node::config::{Config, Opt};
 use graph_node::store_builder::StoreBuilder;
@@ -153,7 +154,7 @@ pub async fn create_subgraph(
 ) -> Result<DeploymentLocator, StoreError> {
     let schema = Schema::parse(schema, subgraph_id.clone()).unwrap();
 
-    let manifest = SubgraphManifest::<graph_chain_ethereum::Chain> {
+    let manifest = SubgraphManifest::<graph::blockchain::mock::MockBlockchain> {
         id: subgraph_id.clone(),
         spec_version: Version::new(1, 0, 0),
         features: BTreeSet::new(),
@@ -226,11 +227,13 @@ pub async fn transact_errors(
         .await?
         .transact_block_operations(
             block_ptr_to,
-            None,
+            FirehoseCursor::None,
             Vec::new(),
             &stopwatch_metrics,
             Vec::new(),
             errs,
+            Vec::new(),
+            Vec::new(),
         )
         .await?;
     flush(deployment).await
@@ -243,8 +246,15 @@ pub async fn transact_entity_operations(
     block_ptr_to: BlockPtr,
     ops: Vec<EntityOperation>,
 ) -> Result<(), StoreError> {
-    transact_entities_and_dynamic_data_sources(store, deployment.clone(), block_ptr_to, vec![], ops)
-        .await
+    transact_entities_and_dynamic_data_sources(
+        store,
+        deployment.clone(),
+        block_ptr_to,
+        vec![],
+        ops,
+        vec![],
+    )
+    .await
 }
 
 /// Convenience to transact EntityOperation instead of EntityModification and wait for the store to process the operations
@@ -260,6 +270,7 @@ pub async fn transact_and_wait(
         block_ptr_to,
         vec![],
         ops,
+        vec![],
     )
     .await?;
     flush(deployment).await
@@ -271,10 +282,11 @@ pub async fn transact_entities_and_dynamic_data_sources(
     block_ptr_to: BlockPtr,
     data_sources: Vec<StoredDynamicDataSource>,
     ops: Vec<EntityOperation>,
+    manifest_idx_and_name: Vec<(u32, String)>,
 ) -> Result<(), StoreError> {
     let store =
         futures03::executor::block_on(store.cheap_clone().writable(LOGGER.clone(), deployment.id))?;
-    let mut entity_cache = EntityCache::new(store.clone());
+    let mut entity_cache = EntityCache::new(Arc::new(store.clone()));
     entity_cache.append(ops);
     let mods = entity_cache
         .as_modifications()
@@ -290,10 +302,12 @@ pub async fn transact_entities_and_dynamic_data_sources(
     store
         .transact_block_operations(
             block_ptr_to,
-            None,
+            FirehoseCursor::None,
             mods,
             &stopwatch_metrics,
             data_sources,
+            Vec::new(),
+            manifest_idx_and_name,
             Vec::new(),
         )
         .await
@@ -306,7 +320,7 @@ pub async fn revert_block(store: &Arc<Store>, deployment: &DeploymentLocator, pt
         .writable(LOGGER.clone(), deployment.id)
         .await
         .expect("can get writable")
-        .revert_block_operations(ptr.clone(), None)
+        .revert_block_operations(ptr.clone(), FirehoseCursor::None)
         .await
         .unwrap();
     flush(deployment).await.unwrap();
@@ -336,9 +350,8 @@ pub async fn insert_entities(
         .into_iter()
         .map(|(entity_type, data)| EntityOperation::Set {
             key: EntityKey {
-                subgraph_id: deployment.hash.clone(),
                 entity_type: entity_type.to_owned(),
-                entity_id: data.get("id").unwrap().clone().as_string().unwrap(),
+                entity_id: data.get("id").unwrap().clone().as_string().unwrap().into(),
             },
             data,
         });
@@ -408,8 +421,8 @@ macro_rules! return_err {
     };
 }
 
-pub fn result_size_metrics() -> Arc<ResultSizeMetrics> {
-    Arc::new(ResultSizeMetrics::make(METRICS_REGISTRY.clone()))
+pub fn graphql_metrics() -> Arc<GraphQLMetrics> {
+    Arc::new(GraphQLMetrics::make(METRICS_REGISTRY.clone()))
 }
 
 async fn execute_subgraph_query_internal(
@@ -419,12 +432,11 @@ async fn execute_subgraph_query_internal(
     deadline: Option<Instant>,
 ) -> QueryResults {
     let logger = Logger::root(slog::Discard, o!());
-    let id = match target {
-        QueryTarget::Deployment(id) => id,
+    let (id, version) = match target {
+        QueryTarget::Deployment(id, version) => (id, version),
         _ => unreachable!("tests do not use this"),
     };
-    let schema = SUBGRAPH_STORE.api_schema(&id).unwrap();
-
+    let schema = SUBGRAPH_STORE.api_schema(&id, &Default::default()).unwrap();
     let status = StatusStore::status(
         STORE.as_ref(),
         status::Filter::Deployments(vec![id.to_string()]),
@@ -437,26 +449,32 @@ async fn execute_subgraph_query_internal(
         network,
         query,
         max_complexity,
-        100
+        100,
+        graphql_metrics(),
     ));
     let mut result = QueryResults::empty();
     let deployment = query.schema.id().clone();
     let store = STORE
         .clone()
-        .query_store(deployment.into(), false)
+        .query_store(
+            QueryTarget::Deployment(deployment.into(), version.clone()),
+            false,
+        )
         .await
         .unwrap();
+    let state = store.deployment_state().await.unwrap();
     for (bc, (selection_set, error_policy)) in return_err!(query.block_constraint()) {
         let logger = logger.clone();
         let resolver = return_err!(
             StoreResolver::at_block(
                 &logger,
                 store.clone(),
+                &state,
                 SUBSCRIPTION_MANAGER.clone(),
                 bc,
                 error_policy,
                 query.schema.id().clone(),
-                result_size_metrics()
+                graphql_metrics()
             )
             .await
         );
@@ -481,7 +499,10 @@ async fn execute_subgraph_query_internal(
 
 pub async fn deployment_state(store: &Store, subgraph_id: &DeploymentHash) -> DeploymentState {
     store
-        .query_store(QueryTarget::Deployment(subgraph_id.to_owned()), false)
+        .query_store(
+            QueryTarget::Deployment(subgraph_id.to_owned(), Default::default()),
+            false,
+        )
         .await
         .expect("could get a query store")
         .deployment_state()

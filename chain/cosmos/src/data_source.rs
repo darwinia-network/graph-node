@@ -62,7 +62,7 @@ impl blockchain::DataSource<Chain> for DataSource {
             },
 
             CosmosTrigger::Event { event_data, origin } => {
-                match self.handler_for_event(event_data.event(), *origin) {
+                match self.handler_for_event(event_data.event()?, *origin) {
                     Some(handler) => handler.handler,
                     None => return Ok(None),
                 }
@@ -74,9 +74,10 @@ impl blockchain::DataSource<Chain> for DataSource {
             },
         };
 
-        Ok(Some(TriggerWithHandler::new(
+        Ok(Some(TriggerWithHandler::<Chain>::new(
             trigger.cheap_clone(),
             handler,
+            block.ptr(),
         )))
     }
 
@@ -197,8 +198,8 @@ impl blockchain::DataSource<Chain> for DataSource {
         self.mapping.api_version.clone()
     }
 
-    fn runtime(&self) -> &[u8] {
-        self.mapping.runtime.as_ref()
+    fn runtime(&self) -> Option<Arc<Vec<u8>>> {
+        Some(self.mapping.runtime.cheap_clone())
     }
 }
 
@@ -282,6 +283,7 @@ impl blockchain::UnresolvedDataSource<Chain> for UnresolvedDataSource {
         self,
         resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
+        _manifest_idx: u32,
     ) -> Result<DataSource> {
         let UnresolvedDataSource {
             kind,
@@ -325,6 +327,7 @@ impl blockchain::UnresolvedDataSourceTemplate<Chain> for UnresolvedDataSourceTem
         self,
         _resolver: &Arc<dyn LinkResolver>,
         _logger: &Logger,
+        _manifest_idx: u32,
     ) -> Result<DataSourceTemplate> {
         Err(anyhow!(TEMPLATE_ERROR))
     }
@@ -339,7 +342,11 @@ impl blockchain::DataSourceTemplate<Chain> for DataSourceTemplate {
         unimplemented!("{}", TEMPLATE_ERROR);
     }
 
-    fn runtime(&self) -> &[u8] {
+    fn runtime(&self) -> Option<Arc<Vec<u8>>> {
+        unimplemented!("{}", TEMPLATE_ERROR);
+    }
+
+    fn manifest_idx(&self) -> u32 {
         unimplemented!("{}", TEMPLATE_ERROR);
     }
 }

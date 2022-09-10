@@ -1,6 +1,7 @@
 use anyhow::Error;
 use async_stream::stream;
 use futures03::Stream;
+use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -10,6 +11,7 @@ use crate::anyhow::Result;
 use crate::components::store::{BlockNumber, DeploymentLocator};
 use crate::data::subgraph::UnifiedMappingApiVersion;
 use crate::firehose;
+use crate::substreams::BlockScopedData;
 use crate::{prelude::*, prometheus::labels};
 
 pub struct BufferedBlockStream<C: Blockchain> {
@@ -85,11 +87,11 @@ pub trait BlockStream<C: Blockchain>:
 /// BlockStreamBuilder is an abstraction that would separate the logic for building streams from the blockchain trait
 #[async_trait]
 pub trait BlockStreamBuilder<C: Blockchain>: Send + Sync {
-    fn build_firehose(
+    async fn build_firehose(
         &self,
         chain: &C,
         deployment: DeploymentLocator,
-        block_cursor: Option<String>,
+        block_cursor: FirehoseCursor,
         start_blocks: Vec<BlockNumber>,
         subgraph_current_block: Option<BlockPtr>,
         filter: Arc<C::TriggerFilter>,
@@ -107,7 +109,50 @@ pub trait BlockStreamBuilder<C: Blockchain>: Send + Sync {
     ) -> Result<Box<dyn BlockStream<C>>>;
 }
 
-pub type FirehoseCursor = Option<String>;
+#[derive(Debug, Clone)]
+pub struct FirehoseCursor(Option<String>);
+
+impl FirehoseCursor {
+    #[allow(non_upper_case_globals)]
+    pub const None: Self = FirehoseCursor(None);
+
+    pub fn is_none(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+impl fmt::Display for FirehoseCursor {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        f.write_str(&self.0.as_deref().unwrap_or(""))
+    }
+}
+
+impl From<String> for FirehoseCursor {
+    fn from(cursor: String) -> Self {
+        // Treat a cursor of "" as None, not absolutely necessary for correctness since the firehose
+        // treats both as the same, but makes it a little clearer.
+        if cursor == "" {
+            FirehoseCursor::None
+        } else {
+            FirehoseCursor(Some(cursor))
+        }
+    }
+}
+
+impl From<Option<String>> for FirehoseCursor {
+    fn from(cursor: Option<String>) -> Self {
+        match cursor {
+            None => FirehoseCursor::None,
+            Some(s) => FirehoseCursor::from(s),
+        }
+    }
+}
+
+impl AsRef<Option<String>> for FirehoseCursor {
+    fn as_ref(&self) -> &Option<String> {
+        &self.0
+    }
+}
 
 #[derive(Debug)]
 pub struct BlockWithTriggers<C: Blockchain> {
@@ -230,15 +275,43 @@ pub trait FirehoseMapper<C: Blockchain>: Send + Sync {
     ) -> Result<BlockPtr, Error>;
 }
 
+#[async_trait]
+pub trait SubstreamsMapper<C: Blockchain>: Send + Sync {
+    async fn to_block_stream_event(
+        &self,
+        logger: &Logger,
+        response: &BlockScopedData,
+        // adapter: &Arc<dyn TriggersAdapter<C>>,
+        // filter: &C::TriggerFilter,
+    ) -> Result<Option<BlockStreamEvent<C>>, SubstreamsError>;
+}
+
 #[derive(Error, Debug)]
 pub enum FirehoseError {
     /// We were unable to decode the received block payload into the chain specific Block struct (e.g. chain_ethereum::pb::Block)
     #[error("received gRPC block payload cannot be decoded: {0}")]
     DecodingError(#[from] prost::DecodeError),
 
-    /// Some unknown error occured
+    /// Some unknown error occurred
     #[error("unknown error")]
     UnknownError(#[from] anyhow::Error),
+}
+
+#[derive(Error, Debug)]
+pub enum SubstreamsError {
+    /// We were unable to decode the received block payload into the chain specific Block struct (e.g. chain_ethereum::pb::Block)
+    #[error("received gRPC block payload cannot be decoded: {0}")]
+    DecodingError(#[from] prost::DecodeError),
+
+    /// Some unknown error occurred
+    #[error("unknown error")]
+    UnknownError(#[from] anyhow::Error),
+
+    #[error("multiple module output error")]
+    MultipleModuleOutputError(),
+
+    #[error("unexpected store delta output")]
+    UnexpectedStoreDeltaOutput(),
 }
 
 #[derive(Debug)]
@@ -265,7 +338,7 @@ where
 pub struct BlockStreamMetrics {
     pub deployment_head: Box<Gauge>,
     pub deployment_failed: Box<Gauge>,
-    pub reverted_blocks: Box<Gauge>,
+    pub reverted_blocks: Gauge,
     pub stopwatch: StopwatchMetrics,
 }
 
@@ -335,7 +408,9 @@ mod test {
         ext::futures::{CancelableError, SharedCancelGuard, StreamExtension},
     };
 
-    use super::{BlockStream, BlockStreamEvent, BlockWithTriggers, BufferedBlockStream};
+    use super::{
+        BlockStream, BlockStreamEvent, BlockWithTriggers, BufferedBlockStream, FirehoseCursor,
+    };
 
     #[derive(Debug)]
     struct TestStream {
@@ -359,7 +434,7 @@ mod test {
                     },
                     trigger_data: vec![],
                 },
-                None,
+                FirehoseCursor::None,
             ))))
         }
     }

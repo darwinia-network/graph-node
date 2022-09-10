@@ -94,16 +94,14 @@ async fn select_fastest_client_with_stat(
 }
 
 // Returns an error if the stat is bigger than `max_file_bytes`
-fn restrict_file_size(path: &str, size: u64, max_file_bytes: &Option<u64>) -> Result<(), Error> {
-    if let Some(max_file_bytes) = max_file_bytes {
-        if size > *max_file_bytes {
-            return Err(anyhow!(
-                "IPFS file {} is too large. It can be at most {} bytes but is {} bytes",
-                path,
-                max_file_bytes,
-                size
-            ));
-        }
+fn restrict_file_size(path: &str, size: u64, max_file_bytes: usize) -> Result<(), Error> {
+    if size > max_file_bytes as u64 {
+        return Err(anyhow!(
+            "IPFS file {} is too large. It can be at most {} bytes but is {} bytes",
+            path,
+            max_file_bytes,
+            size
+        ));
     }
     Ok(())
 }
@@ -183,8 +181,8 @@ impl LinkResolverTrait for LinkResolver {
         .await?;
 
         let max_cache_file_size = self.env_vars.mappings.max_ipfs_cache_file_size;
-        let max_file_size = self.env_vars.mappings.max_ipfs_file_bytes.map(|n| n as u64);
-        restrict_file_size(&path, size, &max_file_size)?;
+        let max_file_size = self.env_vars.mappings.max_ipfs_file_bytes;
+        restrict_file_size(&path, size, max_file_size)?;
 
         let req_path = path.clone();
         let timeout = self.timeout;
@@ -192,12 +190,12 @@ impl LinkResolverTrait for LinkResolver {
             .run(move || {
                 let path = req_path.clone();
                 let client = client.clone();
-                async move { Ok(client.cat_all(path.clone(), timeout).await?.to_vec()) }
+                async move { Ok(client.cat_all(&path, timeout).await?.to_vec()) }
             })
             .await?;
 
         // The size reported by `files/stat` is not guaranteed to be exact, so check the limit again.
-        restrict_file_size(&path, data.len() as u64, &max_file_size)?;
+        restrict_file_size(&path, data.len() as u64, max_file_size)?;
 
         // Only cache files if they are not too large
         if data.len() <= max_cache_file_size {
@@ -227,8 +225,8 @@ impl LinkResolverTrait for LinkResolver {
         )
         .await?;
 
-        let max_file_size = self.env_vars.mappings.max_ipfs_file_bytes.map(|n| n as u64);
-        restrict_file_size(&link.link, size, &max_file_size)?;
+        let max_file_size = self.env_vars.mappings.max_ipfs_file_bytes;
+        restrict_file_size(&link.link, size, max_file_size)?;
 
         let link = link.link.clone();
         let data = retry_policy(self.retry, "ipfs.getBlock", &logger)
@@ -259,10 +257,10 @@ impl LinkResolverTrait for LinkResolver {
         )
         .await?;
 
-        let max_file_size = Some(self.env_vars.mappings.max_ipfs_map_file_size as u64);
-        restrict_file_size(path, size, &max_file_size)?;
+        let max_file_size = self.env_vars.mappings.max_ipfs_map_file_size;
+        restrict_file_size(path, size, max_file_size)?;
 
-        let mut stream = client.cat(path.to_string()).await?.fuse().boxed().compat();
+        let mut stream = client.cat(path, None).await?.fuse().boxed().compat();
 
         let mut buf = BytesMut::with_capacity(1024);
 
@@ -334,7 +332,7 @@ mod tests {
     #[tokio::test]
     async fn max_file_size() {
         let mut env_vars = EnvVars::default();
-        env_vars.mappings.max_ipfs_file_bytes = Some(200);
+        env_vars.mappings.max_ipfs_file_bytes = 200;
 
         let file: &[u8] = &[0u8; 201];
         let client = IpfsClient::localhost();

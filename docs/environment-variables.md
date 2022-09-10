@@ -11,7 +11,7 @@ those.
 ## JSON-RPC configuration for EVM chains
 
 - `ETHEREUM_REORG_THRESHOLD`: Maximum expected reorg size, if a larger reorg
-happens, subgraphs might process inconsistent data. Defaults to 250.
+  happens, subgraphs might process inconsistent data. Defaults to 250.
 - `ETHEREUM_POLLING_INTERVAL`: how often to poll Ethereum for new blocks (in ms,
   defaults to 500ms)
 - `GRAPH_ETHEREUM_TARGET_TRIGGERS_PER_BLOCK_RANGE`: The ideal amount of triggers
@@ -29,7 +29,7 @@ happens, subgraphs might process inconsistent data. Defaults to 250.
 - `GRAPH_ETHEREUM_MAX_BLOCK_RANGE_SIZE`: Maximum number of blocks to scan for
   triggers in each request (defaults to 1000).
 - `GRAPH_ETHEREUM_MAX_EVENT_ONLY_RANGE`: Maximum range size for `eth.getLogs`
-  requests that dont filter on contract address, only event signature.
+  requests that dont filter on contract address, only event signature (defaults to 500).
 - `GRAPH_ETHEREUM_JSON_RPC_TIMEOUT`: Timeout for Ethereum JSON-RPC requests.
 - `GRAPH_ETHEREUM_REQUEST_RETRIES`: Number of times to retry JSON-RPC requests
   made against Ethereum. This is used for requests that will not fail the
@@ -37,9 +37,9 @@ happens, subgraphs might process inconsistent data. Defaults to 250.
   so it can be low. This limit guards against scenarios such as requesting a
   block hash that has been reorged. Defaults to 10.
 - `GRAPH_ETHEREUM_BLOCK_INGESTOR_MAX_CONCURRENT_JSON_RPC_CALLS_FOR_TXN_RECEIPTS`:
-   The maximum number of concurrent requests made against Ethereum for
-   requesting transaction receipts during block ingestion.
-   Defaults to 1,000.
+  The maximum number of concurrent requests made against Ethereum for
+  requesting transaction receipts during block ingestion.
+  Defaults to 1,000.
 - `GRAPH_ETHEREUM_FETCH_TXN_RECEIPTS_IN_BATCHES`: Set to `true` to
   disable fetching receipts from the Ethereum node concurrently during
   block ingestion. This will use fewer, batched requests. This is always set to `true`
@@ -51,24 +51,13 @@ happens, subgraphs might process inconsistent data. Defaults to 250.
   database. In production environments, it will cause multiple downloads of
   the same blocks and therefore slow the system down. This setting can not
   be used if the store uses more than one shard.
+- `GRAPH_ETHEREUM_GENESIS_BLOCK_NUMBER`: Specify genesis block number. If the flag
+  is not set, the default value will be `0`.
 
 ## Running mapping handlers
 
 - `GRAPH_MAPPING_HANDLER_TIMEOUT`: amount of time a mapping handler is allowed to
   take (in seconds, default is unlimited)
-- `GRAPH_IPFS_TIMEOUT`: timeout for IPFS, which includes requests for manifest files
-  and from mappings using `ipfs.cat` or `ipfs.map` (in seconds, default is 30).
-- `GRAPH_MAX_IPFS_FILE_BYTES`: maximum size for a file that can be retrieved
-  with `ipfs.cat` (in bytes, default is unlimited)
-- `GRAPH_MAX_IPFS_MAP_FILE_SIZE`: maximum size of files that can be processed
-  with `ipfs.map`. When a file is processed through `ipfs.map`, the entities
-  generated from that are kept in memory until the entire file is done
-  processing. This setting therefore limits how much memory a call to `ipfs.map`
-  may use. (in bytes, defaults to 256MB)
-- `GRAPH_MAX_IPFS_CACHE_SIZE`: maximum number of files cached in the the
-  `ipfs.cat` cache (defaults to 50).
-- `GRAPH_MAX_IPFS_CACHE_FILE_SIZE`: maximum size of files that are cached in the
-  `ipfs.cat` cache (defaults to 1MiB)
 - `GRAPH_ENTITY_CACHE_SIZE`: Size of the entity cache, in kilobytes. Defaults to 10000 which is 10MB.
 - `GRAPH_MAX_API_VERSION`: Maximum `apiVersion` supported, if a developer tries to create a subgraph
   with a higher `apiVersion` than this in their mappings, they'll receive an error. Defaults to `0.0.7`.
@@ -76,6 +65,20 @@ happens, subgraphs might process inconsistent data. Defaults to 250.
   with a higher `apiVersion` than this, they'll receive an error. Defaults to `0.0.5`.
 - `GRAPH_RUNTIME_MAX_STACK_SIZE`: Maximum stack size for the WASM runtime, if exceeded the execution
   stops and an error is thrown. Defaults to 512KiB.
+
+## IPFS
+
+- `GRAPH_IPFS_TIMEOUT`: timeout for IPFS, which includes requests for manifest files
+  and from mappings (in seconds, default is 30).
+- `GRAPH_MAX_IPFS_FILE_BYTES`: maximum size for a file that can be retrieved (in bytes, default is 256 MiB).
+- `GRAPH_MAX_IPFS_MAP_FILE_SIZE`: maximum size of files that can be processed
+  with `ipfs.map`. When a file is processed through `ipfs.map`, the entities
+  generated from that are kept in memory until the entire file is done
+  processing. This setting therefore limits how much memory a call to `ipfs.map`
+  may use (in bytes, defaults to 256MB).
+- `GRAPH_MAX_IPFS_CACHE_SIZE`: maximum number of files cached (defaults to 50).
+- `GRAPH_MAX_IPFS_CACHE_FILE_SIZE`: maximum size of each cached file (in bytes, defaults to 1MiB).
+- `GRAPH_MAX_IPFS_CONCURRENT_REQUESTS`: maximum concurrent requests to IPFS from file data sources (defaults to 100).
 
 ## GraphQL
 
@@ -104,7 +107,7 @@ happens, subgraphs might process inconsistent data. Defaults to 250.
   value for both is unlimited.
 - `GRAPH_GRAPHQL_MAX_OPERATIONS_PER_CONNECTION`: maximum number of GraphQL
   operations per WebSocket connection. Any operation created after the limit
-  will return an error to the client. Default: unlimited.
+  will return an error to the client. Default: 1000.
 - `GRAPH_GRAPHQL_HTTP_PORT` : Port for the GraphQL HTTP server
 - `GRAPH_GRAPHQL_WS_PORT` : Port for the GraphQL WebSocket server
 - `GRAPH_SQL_STATEMENT_TIMEOUT`: the maximum number of seconds an
@@ -114,12 +117,17 @@ happens, subgraphs might process inconsistent data. Defaults to 250.
   mechanism that is used to trigger updates on GraphQL subscriptions. When
   this variable is set to any value, `graph-node` will still accept GraphQL
   subscriptions, but they won't receive any updates.
+- `ENABLE_GRAPHQL_VALIDATIONS`: enables GraphQL validations, based on the GraphQL specification.
+  This will validate and ensure every query executes follows the execution rules.
+- `SILENT_GRAPHQL_VALIDATIONS`: If `ENABLE_GRAPHQL_VALIDATIONS` is enabled, you are also able to just
+  silently print the GraphQL validation errors, without failing the actual query. Note: queries
+  might still fail as part of the later stage validations running, during GraphQL engine execution.
 
 ### GraphQL caching
 
 - `GRAPH_CACHED_SUBGRAPH_IDS`: when set to `*`, cache all subgraphs (default behavior). Otherwise, a comma-separated list of subgraphs for which to cache queries.
 - `GRAPH_QUERY_CACHE_BLOCKS`: How many recent blocks per network should be kept in the query cache. This should be kept small since the lookup time and the cache memory usage are proportional to this value. Set to 0 to disable the cache. Defaults to 1.
-- `GRAPH_QUERY_CACHE_MAX_MEM`: Maximum total memory to be used by the query cache, in MB. The total amount of memory used for caching will be twice this value - once for recent blocks, divided evenly among the `GRAPH_QUERY_CACHE_BLOCKS`, and once for frequent queries against older blocks.  The default is plenty for most loads, particularly if `GRAPH_QUERY_CACHE_BLOCKS` is kept small. Defaults to 1000, which corresponds to 1GB.
+- `GRAPH_QUERY_CACHE_MAX_MEM`: Maximum total memory to be used by the query cache, in MB. The total amount of memory used for caching will be twice this value - once for recent blocks, divided evenly among the `GRAPH_QUERY_CACHE_BLOCKS`, and once for frequent queries against older blocks. The default is plenty for most loads, particularly if `GRAPH_QUERY_CACHE_BLOCKS` is kept small. Defaults to 1000, which corresponds to 1GB.
 - `GRAPH_QUERY_CACHE_STALE_PERIOD`: Number of queries after which a cache entry can be considered stale. Defaults to 100.
 
 ## Miscellaneous
@@ -128,6 +136,12 @@ happens, subgraphs might process inconsistent data. Defaults to 250.
   in parallel and deploy to specific nodes; each ID must be unique among the set
   of nodes. A single node should have the same value between consecutive restarts.
   Subgraphs get assigned to node IDs and are not reassigned to other nodes automatically.
+- `GRAPH_NODE_ID_USE_LITERAL_VALUE`: (Docker only) Use the literal `node_id`
+  provided to the docker start script instead of replacing hyphens (-) in names
+  with underscores (\_). Changing this for an existing `graph-node`
+  installation requires also changing the assigned node IDs in the
+  `subgraphs.subgraph_deployment_assignment` table in the database. This can be
+  done with GraphMan or via the PostgreSQL command line.
 - `GRAPH_LOG`: control log levels, the same way that `RUST_LOG` is described
   [here](https://docs.rs/env_logger/0.6.0/env_logger/)
 - `THEGRAPH_STORE_POSTGRES_DIESEL_URL`: postgres instance used when running
@@ -176,8 +190,8 @@ happens, subgraphs might process inconsistent data. Defaults to 250.
   decisions. Set to `true` to turn simulation on, defaults to `false`
 - `GRAPH_STORE_CONNECTION_TIMEOUT`: How long to wait to connect to a
   database before assuming the database is down in ms. Defaults to 5000ms.
-- `EXPERIMENTAL_SUBGRAPH_VERSION_SWITCHING_MODE`: default is `instant`, set 
-  to `synced` to only switch a named subgraph to a new deployment once it 
+- `EXPERIMENTAL_SUBGRAPH_VERSION_SWITCHING_MODE`: default is `instant`, set
+  to `synced` to only switch a named subgraph to a new deployment once it
   has synced, making the new deployment the "Pending" version.
 - `GRAPH_REMOVE_UNUSED_INTERVAL`: How long to wait before removing an
   unused deployment. The system periodically checks and marks deployments

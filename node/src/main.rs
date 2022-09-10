@@ -17,6 +17,8 @@ use graph_chain_arweave::{self as arweave, Block as ArweaveBlock};
 use graph_chain_cosmos::{self as cosmos, Block as CosmosFirehoseBlock};
 use graph_chain_ethereum as ethereum;
 use graph_chain_near::{self as near, HeaderOnlyBlock as NearFirehoseHeaderOnlyBlock};
+use graph_chain_substreams as substreams;
+use graph_core::polling_monitor::ipfs_service::IpfsService;
 use graph_core::{
     LinkResolver, MetricsRegistry, SubgraphAssignmentProvider as IpfsSubgraphAssignmentProvider,
     SubgraphInstanceManager, SubgraphRegistrar as IpfsSubgraphRegistrar,
@@ -24,7 +26,7 @@ use graph_core::{
 use graph_graphql::prelude::GraphQlRunner;
 use graph_node::chain::{
     connect_ethereum_networks, connect_firehose_networks, create_ethereum_networks,
-    create_firehose_networks, create_ipfs_clients,
+    create_firehose_networks, create_ipfs_clients, create_substreams_networks,
 };
 use graph_node::config::Config;
 use graph_node::opt;
@@ -47,14 +49,20 @@ use tokio::sync::mpsc;
 
 git_testament!(TESTAMENT);
 
-fn read_expensive_queries() -> Result<Vec<Arc<q::Document>>, std::io::Error> {
+fn read_expensive_queries(
+    logger: &Logger,
+    expensive_queries_filename: String,
+) -> Result<Vec<Arc<q::Document>>, std::io::Error> {
     // A file with a list of expensive queries, one query per line
     // Attempts to run these queries will return a
     // QueryExecutionError::TooExpensive to clients
-    const EXPENSIVE_QUERIES: &str = "/etc/graph-node/expensive-queries.txt";
-    let path = Path::new(EXPENSIVE_QUERIES);
+    let path = Path::new(&expensive_queries_filename);
     let mut queries = Vec::new();
     if path.exists() {
+        info!(
+            logger,
+            "Reading expensive queries file: {}", expensive_queries_filename
+        );
         let file = std::fs::File::open(path)?;
         let reader = BufReader::new(file);
         for line in reader.lines() {
@@ -63,7 +71,7 @@ fn read_expensive_queries() -> Result<Vec<Arc<q::Document>>, std::io::Error> {
                 .map_err(|e| {
                     let msg = format!(
                         "invalid GraphQL query in {}: {}\n{}",
-                        EXPENSIVE_QUERIES,
+                        expensive_queries_filename,
                         e.to_string(),
                         line
                     );
@@ -72,6 +80,11 @@ fn read_expensive_queries() -> Result<Vec<Arc<q::Document>>, std::io::Error> {
                 .into_static();
             queries.push(Arc::new(query));
         }
+    } else {
+        warn!(
+            logger,
+            "Expensive queries file not set to a valid file: {}", expensive_queries_filename
+        );
     }
     Ok(queries)
 }
@@ -79,10 +92,6 @@ fn read_expensive_queries() -> Result<Vec<Arc<q::Document>>, std::io::Error> {
 #[tokio::main]
 async fn main() {
     env_logger::init();
-
-    // Allow configuring fail points on debug builds. Used for integration tests.
-    #[cfg(debug_assertions)]
-    std::mem::forget(fail::FailScenario::setup());
 
     let opt = opt::Opt::from_args();
 
@@ -124,8 +133,8 @@ async fn main() {
         std::process::exit(0);
     }
 
-    let node_id =
-        NodeId::new(opt.node_id.clone()).expect("Node ID must contain only a-z, A-Z, 0-9, and '_'");
+    let node_id = NodeId::new(opt.node_id.clone())
+        .expect("Node ID must be between 1 and 63 characters in length");
     let query_only = config.query_only(&node_id);
 
     // Obtain subgraph related command-line arguments
@@ -185,6 +194,13 @@ async fn main() {
 
     // Try to create IPFS clients for each URL specified in `--ipfs`
     let ipfs_clients: Vec<_> = create_ipfs_clients(&logger, &opt.ipfs);
+    let ipfs_client = ipfs_clients.first().cloned().expect("Missing IPFS client");
+    let ipfs_service = IpfsService::new(
+        ipfs_client,
+        ENV_VARS.mappings.max_ipfs_file_bytes as u64,
+        ENV_VARS.mappings.ipfs_timeout,
+        ENV_VARS.mappings.max_ipfs_concurrent_requests,
+    );
 
     // Convert the clients into a link resolver. Since we want to get past
     // possible temporary DNS failures, make the resolver retry
@@ -215,16 +231,22 @@ async fn main() {
     let mut firehose_networks_by_kind = if query_only {
         BTreeMap::new()
     } else {
-        create_firehose_networks(logger.clone(), metrics_registry.clone(), &config)
-            .await
-            .expect("Failed to parse Firehose networks")
+        create_firehose_networks(logger.clone(), &config)
+    };
+
+    let substreams_networks_by_kind = if query_only {
+        BTreeMap::new()
+    } else {
+        create_substreams_networks(logger.clone(), &config)
     };
 
     let graphql_metrics_registry = metrics_registry.clone();
 
     let contention_logger = logger.clone();
 
-    let expensive_queries = read_expensive_queries().unwrap();
+    // TODO: make option loadable from configuration TOML and environment:
+    let expensive_queries =
+        read_expensive_queries(&logger, opt.expensive_queries_filename).unwrap();
 
     let store_builder = StoreBuilder::new(
         &logger,
@@ -297,10 +319,12 @@ async fn main() {
             node_id.clone(),
             metrics_registry.clone(),
             firehose_networks_by_kind.get(&BlockchainKind::Ethereum),
+            substreams_networks_by_kind.get(&BlockchainKind::Ethereum),
             &eth_networks,
             network_store.as_ref(),
             chain_head_update_listener,
             &logger_factory,
+            metrics_registry.clone(),
         );
 
         let near_chains = near_networks_as_chains(
@@ -333,14 +357,10 @@ async fn main() {
             network_store.clone(),
             subscription_manager.clone(),
             load_manager,
-            metrics_registry.clone(),
-        ));
-        let mut graphql_server = GraphQLQueryServer::new(
-            &logger_factory,
             graphql_metrics_registry,
-            graphql_runner.clone(),
-            node_id.clone(),
-        );
+        ));
+        let mut graphql_server =
+            GraphQLQueryServer::new(&logger_factory, graphql_runner.clone(), node_id.clone());
         let subscription_server =
             GraphQLSubscriptionServer::new(&logger, graphql_runner.clone(), network_store.clone());
 
@@ -399,6 +419,7 @@ async fn main() {
             blockchain_map.cheap_clone(),
             metrics_registry.clone(),
             link_resolver.clone(),
+            ipfs_service,
             static_filters,
         );
 
@@ -485,6 +506,7 @@ async fn main() {
                             node_id,
                             debug_fork,
                             start_block,
+                            None,
                         )
                         .await
                 }
@@ -614,10 +636,12 @@ fn ethereum_networks_as_chains(
     node_id: NodeId,
     registry: Arc<MetricsRegistry>,
     firehose_networks: Option<&FirehoseNetworks>,
+    substreams_networks: Option<&FirehoseNetworks>,
     eth_networks: &EthereumNetworks,
     store: &Store,
     chain_head_update_listener: Arc<ChainHeadUpdateListener>,
     logger_factory: &LoggerFactory,
+    metrics_registry: Arc<MetricsRegistry>,
 ) -> HashMap<String, Arc<ethereum::Chain>> {
     let chains: Vec<_> = eth_networks
         .networks
@@ -681,6 +705,26 @@ fn ethereum_networks_as_chains(
 
     for (network_name, chain) in chains.iter().cloned() {
         blockchain_map.insert::<graph_chain_ethereum::Chain>(network_name, chain)
+    }
+
+    if let Some(substreams_networks) = substreams_networks {
+        for (network_name, firehose_endpoints) in substreams_networks.networks.iter() {
+            let chain_store = blockchain_map
+                .get::<graph_chain_ethereum::Chain>(network_name.clone())
+                .expect("any substreams endpoint needs an rpc or firehose chain defined")
+                .chain_store();
+
+            blockchain_map.insert::<substreams::Chain>(
+                network_name.clone(),
+                Arc::new(substreams::Chain::new(
+                    logger_factory.clone(),
+                    firehose_endpoints.clone(),
+                    metrics_registry.clone(),
+                    chain_store,
+                    Arc::new(substreams::BlockStreamBuilder::new()),
+                )),
+            );
+        }
     }
 
     HashMap::from_iter(chains)

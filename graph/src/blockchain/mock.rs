@@ -1,7 +1,6 @@
 use crate::{
     components::{link_resolver::LinkResolver, store::BlockNumber},
     prelude::DataSourceTemplateInfo,
-    runtime::gas::GasCounter,
 };
 use anyhow::Error;
 use async_trait::async_trait;
@@ -9,18 +8,21 @@ use core::fmt;
 use serde::Deserialize;
 use std::{convert::TryFrom, sync::Arc};
 
-use super::{block_stream, HostFn, IngestorError, TriggerWithHandler};
+use super::{
+    block_stream::{self, FirehoseCursor},
+    HostFn, IngestorError, TriggerWithHandler,
+};
 
 use super::{
     block_stream::BlockWithTriggers, Block, BlockPtr, Blockchain, BlockchainKind, DataSource,
-    DataSourceTemplate, MappingTrigger, NodeCapabilities, RuntimeAdapter, TriggerData,
-    TriggerFilter, TriggersAdapter, UnresolvedDataSource, UnresolvedDataSourceTemplate,
+    DataSourceTemplate, NodeCapabilities, RuntimeAdapter, TriggerData, TriggerFilter,
+    TriggersAdapter, UnresolvedDataSource, UnresolvedDataSourceTemplate,
 };
 
 #[derive(Debug)]
 pub struct MockBlockchain;
 
-#[derive(Clone, Hash, Eq, PartialEq, Debug)]
+#[derive(Clone, Hash, Eq, PartialEq, Debug, Default)]
 pub struct MockBlock {
     pub number: u64,
 }
@@ -84,7 +86,7 @@ impl<C: Blockchain> DataSource<C> for MockDataSource {
         todo!()
     }
 
-    fn runtime(&self) -> &[u8] {
+    fn runtime(&self) -> Option<Arc<Vec<u8>>> {
         todo!()
     }
 
@@ -126,6 +128,7 @@ impl<C: Blockchain> UnresolvedDataSource<C> for MockUnresolvedDataSource {
         self,
         _resolver: &Arc<dyn LinkResolver>,
         _logger: &slog::Logger,
+        _manifest_idx: u32,
     ) -> Result<C::DataSource, anyhow::Error> {
         todo!()
     }
@@ -139,11 +142,15 @@ impl<C: Blockchain> DataSourceTemplate<C> for MockDataSourceTemplate {
         todo!()
     }
 
-    fn runtime(&self) -> &[u8] {
+    fn runtime(&self) -> Option<Arc<Vec<u8>>> {
         todo!()
     }
 
     fn name(&self) -> &str {
+        todo!()
+    }
+
+    fn manifest_idx(&self) -> u32 {
         todo!()
     }
 }
@@ -157,6 +164,7 @@ impl<C: Blockchain> UnresolvedDataSourceTemplate<C> for MockUnresolvedDataSource
         self,
         _resolver: &Arc<dyn LinkResolver>,
         _logger: &slog::Logger,
+        _manifest_idx: u32,
     ) -> Result<C::DataSourceTemplate, anyhow::Error> {
         todo!()
     }
@@ -212,16 +220,6 @@ impl TriggerData for MockTriggerData {
 
 #[derive(Debug)]
 pub struct MockMappingTrigger {}
-
-impl MappingTrigger for MockMappingTrigger {
-    fn to_asc_ptr<H: crate::runtime::AscHeap>(
-        self,
-        _heap: &mut H,
-        _gas: &GasCounter,
-    ) -> Result<crate::runtime::AscPtr<()>, crate::runtime::DeterministicHostError> {
-        todo!()
-    }
-}
 
 #[derive(Clone, Default)]
 pub struct MockTriggerFilter;
@@ -304,7 +302,7 @@ impl Blockchain for MockBlockchain {
     async fn new_firehose_block_stream(
         &self,
         _deployment: crate::components::store::DeploymentLocator,
-        _block_cursor: Option<String>,
+        _block_cursor: FirehoseCursor,
         _start_blocks: Vec<crate::components::store::BlockNumber>,
         _subgraph_current_block: Option<BlockPtr>,
         _filter: std::sync::Arc<Self::TriggerFilter>,

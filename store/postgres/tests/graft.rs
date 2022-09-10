@@ -1,3 +1,4 @@
+use graph::blockchain::block_stream::FirehoseCursor;
 use hex_literal::hex;
 use lazy_static::lazy_static;
 use std::{marker::PhantomData, str::FromStr};
@@ -115,7 +116,18 @@ where
         let deployment = insert_test_data(store.clone()).await;
 
         // Run test
-        test(store, deployment).await.expect("graft test succeeds");
+        test(store.cheap_clone(), deployment.clone())
+            .await
+            .expect("graft test succeeds");
+
+        store
+            .cheap_clone()
+            .writable(LOGGER.clone(), deployment.id)
+            .await
+            .unwrap()
+            .flush()
+            .await
+            .unwrap();
     })
 }
 
@@ -250,11 +262,10 @@ fn create_test_entity(
     );
 
     EntityOperation::Set {
-        key: EntityKey::data(
-            TEST_SUBGRAPH_ID.clone(),
-            entity_type.to_owned(),
-            id.to_owned(),
-        ),
+        key: EntityKey {
+            entity_type: EntityType::new(entity_type.to_string()),
+            entity_id: id.into(),
+        },
         data: test_entity,
     }
 }
@@ -317,7 +328,10 @@ async fn check_graft(
     // Make our own entries for block 2
     shaq.set("email", "shaq@gmail.com");
     let op = EntityOperation::Set {
-        key: EntityKey::data(deployment.hash.clone(), USER.to_owned(), "3".to_owned()),
+        key: EntityKey {
+            entity_type: EntityType::new(USER.to_owned()),
+            entity_id: "3".into(),
+        },
         data: shaq,
     };
     transact_and_wait(&store, &deployment, BLOCKS[2].clone(), vec![op])
@@ -326,14 +340,14 @@ async fn check_graft(
 
     let writable = store.writable(LOGGER.clone(), deployment.id).await?;
     writable
-        .revert_block_operations(BLOCKS[1].clone(), None)
+        .revert_block_operations(BLOCKS[1].clone(), FirehoseCursor::None)
         .await
         .expect("We can revert a block we just created");
     writable.flush().await.expect("we can revert to BLOCKS[1]");
 
     let err = {
         match writable
-            .revert_block_operations(BLOCKS[0].clone(), None)
+            .revert_block_operations(BLOCKS[0].clone(), FirehoseCursor::None)
             .await
         {
             Ok(()) => writable.flush().await,

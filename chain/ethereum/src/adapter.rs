@@ -6,8 +6,6 @@ use graph::firehose::CallToFilter;
 use graph::firehose::CombinedFilter;
 use graph::firehose::LogFilter;
 use itertools::Itertools;
-use mockall::automock;
-use mockall::predicate::*;
 use prost::Message;
 use prost_types::Any;
 use std::cmp;
@@ -445,22 +443,11 @@ impl EthereumCallFilter {
             return false;
         }
 
-        // Make sure the call input size is multiple of 32, otherwise we can't decode it.
-        // This is due to the Ethereum ABI spec: https://docs.soliditylang.org/en/v0.8.11/abi-spec.html
+        // The `call.input.len()` is validated in the
+        // DataSource::match_and_decode function.
+        // Those calls are logged as warning and skipped.
         //
-        // A scenario where the input could have the wrong size is when a `delegatecall` is
-        // "disguised" as a `call`. For example for this couple of transactions/calls:
-        // 1. https://etherscan.io/tx/0x8e992eeb40e18703dd8169a8031e2113311985f1c20e0723a2dc362df40bafb0
-        // 2. https://etherscan.io/tx/0x7c391bcfa2007f84e123ad47ea72e2d6ffb2fbab81deff0990b0c499e0664a92
-        //
-        // The first one is acting as a proxy to the second one (an atomicMatch_).
-        // If you try to decode the first call as it is/comes from a `traces` RPC request, it
-        // will fail because it has a smaller size/length.
-        let correct_input_size = (call.input.0.len() - 4) % 32 == 0;
-        if !correct_input_size {
-            return false;
-        }
-
+        // See 280b0108-a96e-4738-bb37-60ce11eeb5bf
         let call_signature = &call.input.0[..4];
 
         // Ensure the call is to a contract the filter expressed an interest in
@@ -852,7 +839,6 @@ impl SubgraphEthRpcMetrics {
 ///
 /// Implementations may be implemented against an in-process Ethereum node
 /// or a remote node over RPC.
-#[automock]
 #[async_trait]
 pub trait EthereumAdapter: Send + Sync + 'static {
     fn url_hostname(&self) -> &str;
@@ -1212,9 +1198,9 @@ mod tests {
         );
 
         assert_eq!(
-            false,
+            true,
             filter.matches(&call(address(1), vec![1; 32])),
-            "call with correct address & signature, but with incorrect input size should be ignored"
+            "call with correct address & signature, but with incorrect input size should match"
         );
 
         assert_eq!(

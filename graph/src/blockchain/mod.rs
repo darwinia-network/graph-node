@@ -7,6 +7,7 @@ pub mod firehose_block_ingestor;
 pub mod firehose_block_stream;
 pub mod mock;
 pub mod polling_block_stream;
+pub mod substreams_block_stream;
 mod types;
 
 // Try to reexport most of the necessary types
@@ -14,8 +15,9 @@ use crate::{
     cheap_clone::CheapClone,
     components::store::{DeploymentLocator, StoredDynamicDataSource},
     data::subgraph::UnifiedMappingApiVersion,
+    data_source,
     prelude::DataSourceContext,
-    runtime::{gas::GasCounter, AscHeap, AscPtr, DeterministicHostError, HostExportError},
+    runtime::{gas::GasCounter, AscHeap, HostExportError},
 };
 use crate::{
     components::{
@@ -29,7 +31,6 @@ use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use slog::Logger;
-use slog::{self, SendSyncRefUnwindSafeKV};
 use std::{
     any::Any,
     collections::HashMap,
@@ -43,7 +44,7 @@ use web3::types::H256;
 pub use block_stream::{ChainHeadUpdateListener, ChainHeadUpdateStream, TriggersAdapter};
 pub use types::{BlockHash, BlockPtr, ChainIdentifier};
 
-use self::block_stream::BlockStream;
+use self::block_stream::{BlockStream, FirehoseCursor};
 
 pub trait TriggersAdapterSelector<C: Blockchain>: Sync + Send {
     fn triggers_adapter(
@@ -80,22 +81,23 @@ pub trait Block: Send + Sync {
 // This is only `Debug` because some tests require that
 pub trait Blockchain: Debug + Sized + Send + Sync + Unpin + 'static {
     const KIND: BlockchainKind;
+    const ALIASES: &'static [&'static str] = &[];
 
     // The `Clone` bound is used when reprocessing a block, because `triggers_in_block` requires an
     // owned `Block`. It would be good to come up with a way to remove this bound.
-    type Block: Block + Clone + Debug;
+    type Block: Block + Clone + Debug + Default;
     type DataSource: DataSource<Self>;
     type UnresolvedDataSource: UnresolvedDataSource<Self>;
 
     type DataSourceTemplate: DataSourceTemplate<Self> + Clone;
-    type UnresolvedDataSourceTemplate: UnresolvedDataSourceTemplate<Self>;
+    type UnresolvedDataSourceTemplate: UnresolvedDataSourceTemplate<Self> + Clone;
 
     /// Trigger data as parsed from the triggers adapter.
     type TriggerData: TriggerData + Ord + Send + Sync + Debug;
 
     /// Decoded trigger ready to be processed by the mapping.
     /// New implementations should have this be the same as `TriggerData`.
-    type MappingTrigger: MappingTrigger + Debug;
+    type MappingTrigger: Send + Sync + Debug;
 
     /// Trigger filter used as input to the triggers adapter.
     type TriggerFilter: TriggerFilter<Self>;
@@ -112,7 +114,7 @@ pub trait Blockchain: Debug + Sized + Send + Sync + Unpin + 'static {
     async fn new_firehose_block_stream(
         &self,
         deployment: DeploymentLocator,
-        block_cursor: Option<String>,
+        block_cursor: FirehoseCursor,
         start_blocks: Vec<BlockNumber>,
         subgraph_current_block: Option<BlockPtr>,
         filter: Arc<Self::TriggerFilter>,
@@ -199,7 +201,7 @@ pub trait DataSource<C: Blockchain>:
     fn context(&self) -> Arc<Option<DataSourceContext>>;
     fn creation_block(&self) -> Option<BlockNumber>;
     fn api_version(&self) -> semver::Version;
-    fn runtime(&self) -> &[u8];
+    fn runtime(&self) -> Option<Arc<Vec<u8>>>;
 
     /// Checks if `trigger` matches this data source, and if so decodes it into a `MappingTrigger`.
     /// A return of `Ok(None)` mean the trigger does not match.
@@ -240,13 +242,15 @@ pub trait UnresolvedDataSourceTemplate<C: Blockchain>:
         self,
         resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
+        manifest_idx: u32,
     ) -> Result<C::DataSourceTemplate, anyhow::Error>;
 }
 
 pub trait DataSourceTemplate<C: Blockchain>: Send + Sync + Debug {
     fn api_version(&self) -> semver::Version;
-    fn runtime(&self) -> &[u8];
+    fn runtime(&self) -> Option<Arc<Vec<u8>>>;
     fn name(&self) -> &str;
+    fn manifest_idx(&self) -> u32;
 }
 
 #[async_trait]
@@ -257,6 +261,7 @@ pub trait UnresolvedDataSource<C: Blockchain>:
         self,
         resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
+        manifest_idx: u32,
     ) -> Result<C::DataSource, anyhow::Error>;
 }
 
@@ -264,16 +269,6 @@ pub trait TriggerData {
     /// If there is an error when processing this trigger, this will called to add relevant context.
     /// For example an useful return is: `"block #<N> (<hash>), transaction <tx_hash>".
     fn error_context(&self) -> String;
-}
-
-pub trait MappingTrigger: Send + Sync {
-    /// A flexible interface for writing a type to AS memory, any pointer can be returned.
-    /// Use `AscPtr::erased` to convert `AscPtr<T>` into `AscPtr<()>`.
-    fn to_asc_ptr<H: AscHeap>(
-        self,
-        heap: &mut H,
-        gas: &GasCounter,
-    ) -> Result<AscPtr<()>, DeterministicHostError>;
 }
 
 pub struct HostFnCtx<'a> {
@@ -323,6 +318,8 @@ pub enum BlockchainKind {
 
     /// Cosmos chains
     Cosmos,
+
+    Substreams,
 }
 
 impl fmt::Display for BlockchainKind {
@@ -332,6 +329,7 @@ impl fmt::Display for BlockchainKind {
             BlockchainKind::Ethereum => "ethereum",
             BlockchainKind::Near => "near",
             BlockchainKind::Cosmos => "cosmos",
+            BlockchainKind::Substreams => "substreams",
         };
         write!(f, "{}", value)
     }
@@ -346,6 +344,7 @@ impl FromStr for BlockchainKind {
             "ethereum" => Ok(BlockchainKind::Ethereum),
             "near" => Ok(BlockchainKind::Near),
             "cosmos" => Ok(BlockchainKind::Cosmos),
+            "substreams" => Ok(BlockchainKind::Substreams),
             _ => Err(anyhow!("unknown blockchain kind {}", s)),
         }
     }
@@ -394,56 +393,4 @@ impl BlockchainMap {
     }
 }
 
-pub struct TriggerWithHandler<C: Blockchain> {
-    trigger: C::MappingTrigger,
-    handler: String,
-    logging_extras: Arc<dyn SendSyncRefUnwindSafeKV>,
-}
-
-impl<C: Blockchain> fmt::Debug for TriggerWithHandler<C> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut builder = f.debug_struct("TriggerWithHandler");
-        builder.field("trigger", &self.trigger);
-        builder.field("handler", &self.handler);
-        builder.finish()
-    }
-}
-
-impl<C: Blockchain> TriggerWithHandler<C> {
-    pub fn new(trigger: C::MappingTrigger, handler: String) -> Self {
-        TriggerWithHandler {
-            trigger,
-            handler,
-            logging_extras: Arc::new(slog::o! {}),
-        }
-    }
-
-    pub fn new_with_logging_extras(
-        trigger: C::MappingTrigger,
-        handler: String,
-        logging_extras: Arc<dyn SendSyncRefUnwindSafeKV>,
-    ) -> Self {
-        TriggerWithHandler {
-            trigger,
-            handler,
-            logging_extras,
-        }
-    }
-
-    /// Additional key-value pairs to be logged with the "Done processing trigger" message.
-    pub fn logging_extras(&self) -> Arc<dyn SendSyncRefUnwindSafeKV> {
-        self.logging_extras.cheap_clone()
-    }
-
-    pub fn handler_name(&self) -> &str {
-        &self.handler
-    }
-
-    pub fn to_asc_ptr<H: AscHeap>(
-        self,
-        heap: &mut H,
-        gas: &GasCounter,
-    ) -> Result<AscPtr<()>, DeterministicHostError> {
-        self.trigger.to_asc_ptr(heap, gas)
-    }
-}
+pub type TriggerWithHandler<C> = data_source::TriggerWithHandler<<C as Blockchain>::MappingTrigger>;
