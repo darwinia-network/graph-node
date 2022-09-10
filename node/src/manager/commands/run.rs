@@ -389,6 +389,7 @@ async fn create_ethereum_networks(
                             logger,
                             provider.label.clone(),
                             &web3.url,
+                            web3.genesis_block_number,
                             transport,
                             eth_rpc_metrics.clone(),
                             supports_eip_1898,

@@ -59,6 +59,7 @@ use crate::{
 pub struct EthereumAdapter {
     logger: Logger,
     url_hostname: Arc<String>,
+    genesis_block_number: u64,
     /// The label for the provider from the configuration
     provider: String,
     web3: Arc<Web3<Transport>>,
@@ -82,6 +83,7 @@ impl CheapClone for EthereumAdapter {
             logger: self.logger.clone(),
             provider: self.provider.clone(),
             url_hostname: self.url_hostname.cheap_clone(),
+            genesis_block_number: self.genesis_block_number,
             web3: self.web3.cheap_clone(),
             metrics: self.metrics.cheap_clone(),
             supports_eip_1898: self.supports_eip_1898,
@@ -94,6 +96,7 @@ impl EthereumAdapter {
         logger: Logger,
         provider: String,
         url: &str,
+        genesis_block_number: u64,
         transport: Transport,
         provider_metrics: Arc<ProviderEthRpcMetrics>,
         supports_eip_1898: bool,
@@ -120,6 +123,7 @@ impl EthereumAdapter {
             logger,
             provider,
             url_hostname: Arc::new(hostname),
+            genesis_block_number,
             web3,
             metrics: provider_metrics,
             supports_eip_1898: supports_eip_1898 && !is_ganache,
@@ -847,6 +851,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
         let web3 = self.web3.clone();
         let metrics = self.metrics.clone();
         let provider = self.provider().to_string();
+        let genesis_block_number = self.genesis_block_number;
         let gen_block_hash_future = retry("eth_getBlockByNumber(0, false) RPC call", &logger)
             .no_limit()
             .timeout_secs(30)
@@ -856,7 +861,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
                 let provider = provider.clone();
                 async move {
                     web3.eth()
-                        .block(BlockId::Number(Web3BlockNumber::Number(4969901.into())))
+                        .block(BlockId::Number(Web3BlockNumber::Number(genesis_block_number.into())))
                         .await
                         .map_err(|e| {
                             metrics.set_status(ProviderStatus::GenesisFail, &provider);

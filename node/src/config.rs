@@ -436,6 +436,12 @@ impl ChainSection {
                 if name.is_empty() {
                     return Err(anyhow!("Ethereum network name cannot be an empty string"));
                 }
+                let (name, genesis_block_number) = if let Some(colon) = name.find('.') {
+                    let (name, block_number) = name.split_at(colon);
+                    (name, block_number[1..].parse::<u64>()?)
+                } else {
+                    (name, 0u64)
+                };
                 if rest.is_empty() {
                     return Err(anyhow!("Ethereum node URL cannot be an empty string"));
                 }
@@ -459,6 +465,7 @@ impl ChainSection {
                     details: ProviderDetails::Web3(Web3Provider {
                         transport,
                         url: url.to_string(),
+                        genesis_block_number,
                         features,
                         headers: Default::default(),
                     }),
@@ -554,6 +561,7 @@ pub struct Web3Provider {
     #[serde(default)]
     pub transport: Transport,
     pub url: String,
+    pub genesis_block_number: u64,
     pub features: BTreeSet<String>,
 
     // TODO: This should be serialized.
@@ -665,6 +673,7 @@ impl<'de> Deserialize<'de> for Provider {
                 let mut details = None;
 
                 let mut url = None;
+                let mut genesis_block_number = 0;
                 let mut transport = None;
                 let mut features = None;
                 let mut headers = None;
@@ -688,6 +697,9 @@ impl<'de> Deserialize<'de> for Provider {
                                 return Err(serde::de::Error::duplicate_field("url"));
                             }
                             url = Some(map.next_value()?);
+                        }
+                        ProviderField::GenesisBlockNumber => {
+                            genesis_block_number = map.next_value()?;
                         }
                         ProviderField::Transport => {
                             if transport.is_some() {
@@ -728,6 +740,7 @@ impl<'de> Deserialize<'de> for Provider {
                     None => ProviderDetails::Web3(Web3Provider {
                         url: url.ok_or_else(|| serde::de::Error::missing_field("url"))?,
                         transport: transport.unwrap_or(Transport::Rpc),
+                        genesis_block_number: genesis_block_number,
                         features: features
                             .ok_or_else(|| serde::de::Error::missing_field("features"))?,
                         headers: headers.unwrap_or_else(|| HeaderMap::new()),
@@ -743,6 +756,7 @@ impl<'de> Deserialize<'de> for Provider {
             "details",
             "transport",
             "url",
+            "genesis_block_number",
             "features",
             "headers",
         ];
@@ -758,6 +772,7 @@ enum ProviderField {
 
     // Deprecated fields
     Url,
+    GenesisBlockNumber,
     Transport,
     Features,
     Headers,
@@ -1110,6 +1125,7 @@ mod tests {
                 details: ProviderDetails::Web3(Web3Provider {
                     transport: Transport::Rpc,
                     url: "http://localhost:8545".to_owned(),
+                    genesis_block_number: 0,
                     features: BTreeSet::new(),
                     headers: HeaderMap::new(),
                 }),
@@ -1135,6 +1151,7 @@ mod tests {
                 details: ProviderDetails::Web3(Web3Provider {
                     transport: Transport::Rpc,
                     url: "http://localhost:8545".to_owned(),
+                    genesis_block_number: 0,
                     features: BTreeSet::new(),
                     headers: HeaderMap::new(),
                 }),
@@ -1199,6 +1216,7 @@ mod tests {
                 details: ProviderDetails::Web3(Web3Provider {
                     transport: Transport::Ipc,
                     url: "http://localhost:8545".to_owned(),
+                    genesis_block_number: 0,
                     features,
                     headers,
                 }),
@@ -1223,6 +1241,7 @@ mod tests {
                 details: ProviderDetails::Web3(Web3Provider {
                     transport: Transport::Rpc,
                     url: "http://localhost:8545".to_owned(),
+                    genesis_block_number: 0,
                     features: BTreeSet::new(),
                     headers: HeaderMap::new(),
                 }),
