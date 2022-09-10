@@ -1,10 +1,12 @@
 use graph::{
     components::{
         server::index_node::VersionInfo,
-        store::{DeploymentLocator, StatusStore},
+        store::{DeploymentId, DeploymentLocator, StatusStore},
     },
+    data::query::QueryTarget,
     data::subgraph::schema::SubgraphHealth,
     data::subgraph::schema::{DeploymentCreate, SubgraphError},
+    prelude::BlockPtr,
     prelude::EntityChange,
     prelude::EntityChangeOperation,
     prelude::QueryStoreManager,
@@ -49,6 +51,16 @@ fn get_version_info(store: &Store, subgraph_name: &str) -> VersionInfo {
     let (current, _) = primary.versions_for_subgraph(subgraph_name).unwrap();
     let current = current.unwrap();
     store.version_info(&current).unwrap()
+}
+
+async fn latest_block(store: &Store, deployment_id: DeploymentId) -> BlockPtr {
+    store
+        .subgraph_store()
+        .writable(LOGGER.clone(), deployment_id)
+        .await
+        .expect("can get writable")
+        .block_ptr()
+        .unwrap()
 }
 
 #[test]
@@ -539,9 +551,22 @@ fn fatal_vs_non_fatal() {
     run_test_sequentially(|store| async move {
         let deployment = setup().await;
         let query_store = store
-            .query_store(deployment.hash.clone().into(), false)
+            .query_store(
+                QueryTarget::Deployment(deployment.hash.clone(), Default::default()),
+                false,
+            )
             .await
             .unwrap();
+
+        // Just to make latest_ethereum_block_number be 0
+        transact_and_wait(
+            &store.subgraph_store(),
+            &deployment,
+            BLOCKS[0].clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
 
         let error = || SubgraphError {
             subgraph_id: deployment.hash.clone(),
@@ -560,13 +585,19 @@ fn fatal_vs_non_fatal() {
             .await
             .unwrap();
 
-        assert!(!query_store.has_non_fatal_errors(None).await.unwrap());
+        assert!(!query_store
+            .has_deterministic_errors(latest_block(&store, deployment.id).await.number)
+            .await
+            .unwrap());
 
         transact_errors(&store, &deployment, BLOCKS[1].clone(), vec![error()])
             .await
             .unwrap();
 
-        assert!(query_store.has_non_fatal_errors(None).await.unwrap());
+        assert!(query_store
+            .has_deterministic_errors(latest_block(&store, deployment.id).await.number)
+            .await
+            .unwrap());
     })
 }
 
@@ -584,7 +615,10 @@ fn fail_unfail_deterministic_error() {
         let deployment = setup().await;
 
         let query_store = store
-            .query_store(deployment.hash.cheap_clone().into(), false)
+            .query_store(
+                QueryTarget::Deployment(deployment.hash.clone(), Default::default()),
+                false,
+            )
             .await
             .unwrap();
 
@@ -599,7 +633,10 @@ fn fail_unfail_deterministic_error() {
         .unwrap();
 
         // We don't have any errors and the subgraph is healthy.
-        assert!(!query_store.has_non_fatal_errors(None).await.unwrap());
+        assert!(!query_store
+            .has_deterministic_errors(latest_block(&store, deployment.id).await.number)
+            .await
+            .unwrap());
         let vi = get_version_info(&store, NAME);
         assert_eq!(&*NAME, vi.deployment_id.as_str());
         assert_eq!(false, vi.failed);
@@ -616,7 +653,10 @@ fn fail_unfail_deterministic_error() {
         .unwrap();
 
         // Still no fatal errors.
-        assert!(!query_store.has_non_fatal_errors(None).await.unwrap());
+        assert!(!query_store
+            .has_deterministic_errors(latest_block(&store, deployment.id).await.number)
+            .await
+            .unwrap());
         let vi = get_version_info(&store, NAME);
         assert_eq!(&*NAME, vi.deployment_id.as_str());
         assert_eq!(false, vi.failed);
@@ -640,7 +680,10 @@ fn fail_unfail_deterministic_error() {
         writable.fail_subgraph(error).await.unwrap();
 
         // Now we have a fatal error because the subgraph failed.
-        assert!(query_store.has_non_fatal_errors(None).await.unwrap());
+        assert!(query_store
+            .has_deterministic_errors(latest_block(&store, deployment.id).await.number)
+            .await
+            .unwrap());
         let vi = get_version_info(&store, NAME);
         assert_eq!(&*NAME, vi.deployment_id.as_str());
         assert_eq!(true, vi.failed);
@@ -649,11 +692,15 @@ fn fail_unfail_deterministic_error() {
         // Unfail the subgraph.
         let outcome = writable
             .unfail_deterministic_error(&BLOCKS[1], &BLOCKS[0])
+            .await
             .unwrap();
 
         // We don't have fatal errors anymore and the block got reverted.
         assert_eq!(outcome, UnfailOutcome::Unfailed);
-        assert!(!query_store.has_non_fatal_errors(None).await.unwrap());
+        assert!(!query_store
+            .has_deterministic_errors(latest_block(&store, deployment.id).await.number)
+            .await
+            .unwrap());
         let vi = get_version_info(&store, NAME);
         assert_eq!(&*NAME, vi.deployment_id.as_str());
         assert_eq!(false, vi.failed);
@@ -724,6 +771,7 @@ fn fail_unfail_deterministic_error_noop() {
         // Run unfail with no errors results in NOOP.
         let outcome = writable
             .unfail_deterministic_error(&BLOCKS[1], &BLOCKS[0])
+            .await
             .unwrap();
 
         // Nothing to unfail, state continues the same.
@@ -755,6 +803,7 @@ fn fail_unfail_deterministic_error_noop() {
         // Running unfail_deterministic_error against a NON-deterministic error will do nothing.
         let outcome = writable
             .unfail_deterministic_error(&BLOCKS[1], &BLOCKS[0])
+            .await
             .unwrap();
 
         // State continues the same, nothing happened.
@@ -781,6 +830,7 @@ fn fail_unfail_deterministic_error_noop() {
         // the hashes won't match and there's nothing to revert.
         let outcome = writable
             .unfail_deterministic_error(&BLOCKS[1], &BLOCKS[0])
+            .await
             .unwrap();
 
         // State continues the same.

@@ -1,7 +1,7 @@
 use crate::{
-    components::store::{DeploymentLocator, EntityType},
+    components::store::{DeploymentLocator, EntityKey, EntityType},
     data::graphql::ObjectTypeExt,
-    prelude::{anyhow::Context, q, r, s, CacheWeight, EntityKey, QueryExecutionError, Schema},
+    prelude::{anyhow::Context, q, r, s, CacheWeight, QueryExecutionError, Schema},
     runtime::gas::{Gas, GasSizeOf},
 };
 use crate::{data::subgraph::DeploymentHash, prelude::EntityChange};
@@ -63,14 +63,8 @@ impl NodeId {
     pub fn new(s: impl Into<String>) -> Result<Self, ()> {
         let s = s.into();
 
-        // Enforce length limit
-        if s.len() > 63 {
-            return Err(());
-        }
-
-        // Check that the ID contains only allowed characters.
-        // Note: these restrictions are relied upon to prevent SQL injection
-        if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        // Enforce minimum and maximum length limit
+        if s.len() > 63 || s.len() < 1 {
             return Err(());
         }
 
@@ -585,9 +579,6 @@ where
     }
 }
 
-// Note: Do not modify fields without making a backward compatible change to the
-//  StableHash impl (below) An entity is represented as a map of attribute names
-//  to values.
 /// An entity is represented as a map of attribute names to values.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct Entity(HashMap<Attribute, Value>);
@@ -600,13 +591,15 @@ impl stable_hash_legacy::StableHash for Entity {
         state: &mut H,
     ) {
         use stable_hash_legacy::SequenceNumber;
-        stable_hash_legacy::StableHash::stable_hash(&self.0, sequence_number.next_child(), state);
+        let Self(inner) = self;
+        stable_hash_legacy::StableHash::stable_hash(inner, sequence_number.next_child(), state);
     }
 }
 
 impl StableHash for Entity {
     fn stable_hash<H: StableHasher>(&self, field_address: H::Addr, state: &mut H) {
-        StableHash::stable_hash(&self.0, field_address.child(0), state);
+        let Self(inner) = self;
+        StableHash::stable_hash(inner, field_address.child(0), state);
     }
 }
 
@@ -878,16 +871,6 @@ pub trait TryIntoEntity {
     fn try_into_entity(self) -> Result<Entity, Error>;
 }
 
-/// A value that can be converted to an `Entity` ID.
-pub trait ToEntityId {
-    fn to_entity_id(&self) -> String;
-}
-
-/// A value that can be converted to an `Entity` key.
-pub trait ToEntityKey {
-    fn to_entity_key(&self, subgraph: DeploymentHash) -> EntityKey;
-}
-
 #[test]
 fn value_bytes() {
     let graphql_value = r::Value::String("0x8f494c66afc1d3f8ac1b45df21f02a46".to_owned());
@@ -949,11 +932,7 @@ fn entity_validation() {
         let schema =
             crate::prelude::Schema::parse(DOCUMENT, subgraph).expect("Failed to parse test schema");
         let id = thing.id().unwrap_or("none".to_owned());
-        let key = EntityKey::data(
-            DeploymentHash::new("doesntmatter").unwrap(),
-            "Thing".to_owned(),
-            id.to_owned(),
-        );
+        let key = EntityKey::data("Thing".to_owned(), id.clone());
 
         let err = thing.validate(&schema, &key);
         if errmsg == "" {

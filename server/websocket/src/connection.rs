@@ -250,17 +250,13 @@ where
                         );
                     }
 
-                    if let Some(max_ops) = ENV_VARS.graphql.max_operations_per_connection {
-                        if operations.operations.len() >= max_ops {
-                            return send_error_string(
-                                &msg_sink,
-                                id,
-                                format!(
-                                    "Reached the limit of {} operations per connection",
-                                    max_ops
-                                ),
-                            );
-                        }
+                    let max_ops = ENV_VARS.graphql.max_operations_per_connection;
+                    if operations.operations.len() >= max_ops {
+                        return send_error_string(
+                            &msg_sink,
+                            id,
+                            format!("Reached the limit of {} operations per connection", max_ops),
+                        );
                     }
 
                     // Parse the GraphQL query document; respond with a GQL_ERROR if
@@ -301,7 +297,7 @@ where
                     };
 
                     // Construct a subscription
-                    let target = QueryTarget::Deployment(deployment.clone());
+                    let target = QueryTarget::Deployment(deployment.clone(), Default::default());
                     let subscription = Subscription {
                         // Subscriptions currently do not benefit from the generational cache
                         // anyways, so don't bother passing a network.

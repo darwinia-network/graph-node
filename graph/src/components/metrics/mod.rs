@@ -3,6 +3,8 @@ pub use prometheus::{
     labels, Counter, CounterVec, Error as PrometheusError, Gauge, GaugeVec, Histogram,
     HistogramOpts, HistogramVec, Opts, Registry,
 };
+pub mod subgraph;
+
 use std::collections::HashMap;
 
 /// Metrics for measuring where time is spent during indexing.
@@ -102,10 +104,10 @@ pub trait MetricsRegistry: Send + Sync + 'static {
         name: &str,
         help: &str,
         subgraph: &str,
-    ) -> Result<Box<Gauge>, PrometheusError> {
+    ) -> Result<Gauge, PrometheusError> {
         let opts = Opts::new(name, help).const_labels(deployment_labels(subgraph));
-        let gauge = Box::new(Gauge::with_opts(opts)?);
-        self.register(name, gauge.clone());
+        let gauge = Gauge::with_opts(opts)?;
+        self.register(name, Box::new(gauge.clone()));
         Ok(gauge)
     }
 
@@ -171,13 +173,9 @@ pub trait MetricsRegistry: Send + Sync + 'static {
         name: &str,
         help: &str,
         subgraph: &str,
-    ) -> Result<Box<Counter>, PrometheusError> {
-        let counter = Box::new(counter_with_labels(
-            name,
-            help,
-            deployment_labels(subgraph),
-        )?);
-        self.register(name, counter.clone());
+    ) -> Result<Counter, PrometheusError> {
+        let counter = counter_with_labels(name, help, deployment_labels(subgraph))?;
+        self.register(name, Box::new(counter.clone()));
         Ok(counter)
     }
 

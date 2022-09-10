@@ -19,6 +19,8 @@ use diesel::{debug_query, OptionalExtension, PgConnection, RunQueryDsl};
 use graph::cheap_clone::CheapClone;
 use graph::constraint_violation;
 use graph::data::graphql::TypeExt as _;
+use graph::data::query::Trace;
+use graph::data::value::Word;
 use graph::prelude::{q, s, StopwatchMetrics, ENV_VARS};
 use graph::slog::warn;
 use inflector::Inflector;
@@ -39,15 +41,15 @@ use crate::{
         FilterQuery, FindManyQuery, FindQuery, InsertQuery, RevertClampQuery, RevertRemoveQuery,
     },
 };
-use graph::components::store::EntityType;
+use graph::components::store::{EntityKey, EntityType};
 use graph::data::graphql::ext::{DirectiveFinder, DocumentExt, ObjectTypeExt};
 use graph::data::schema::{FulltextConfig, FulltextDefinition, Schema, SCHEMA_TYPE_NAME};
 use graph::data::store::BYTES_SCALAR;
 use graph::data::subgraph::schema::{POI_OBJECT, POI_TABLE};
 use graph::prelude::{
     anyhow, info, BlockNumber, DeploymentHash, Entity, EntityChange, EntityCollection,
-    EntityFilter, EntityKey, EntityOperation, EntityOrder, EntityRange, Logger,
-    QueryExecutionError, StoreError, StoreEvent, ValueType, BLOCK_NUMBER_MAX,
+    EntityFilter, EntityOperation, EntityOrder, EntityRange, Logger, QueryExecutionError,
+    StoreError, StoreEvent, ValueType, BLOCK_NUMBER_MAX,
 };
 
 use crate::block_range::{BLOCK_COLUMN, BLOCK_RANGE_COLUMN};
@@ -483,7 +485,7 @@ impl Layout {
         FindQuery::new(table.as_ref(), id, block)
             .get_result::<EntityData>(conn)
             .optional()?
-            .map(|entity_data| entity_data.deserialize_with_layout(self, None))
+            .map(|entity_data| entity_data.deserialize_with_layout(self, None, true))
             .transpose()
     }
 
@@ -509,10 +511,13 @@ impl Layout {
         };
         let mut entities_for_type: BTreeMap<EntityType, Vec<Entity>> = BTreeMap::new();
         for data in query.load::<EntityData>(conn)? {
+            let entity_type = data.entity_type();
+            let entity_data: Entity = data.deserialize_with_layout(self, None, true)?;
+
             entities_for_type
-                .entry(data.entity_type())
+                .entry(entity_type)
                 .or_default()
-                .push(data.deserialize_with_layout(self, None)?);
+                .push(entity_data);
         }
         Ok(entities_for_type)
     }
@@ -541,8 +546,8 @@ impl Layout {
 
         for entity_data in inserts_or_updates.into_iter() {
             let entity_type = entity_data.entity_type();
-            let mut data: Entity = entity_data.deserialize_with_layout(self, None)?;
-            let entity_id = data.id().expect("Invalid ID for entity.");
+            let mut data: Entity = entity_data.deserialize_with_layout(self, None, false)?;
+            let entity_id = Word::from(data.id().expect("Invalid ID for entity."));
             processed_entities.insert((entity_type.clone(), entity_id.clone()));
 
             // `__typename` is not a real field.
@@ -551,7 +556,6 @@ impl Layout {
 
             changes.push(EntityOperation::Set {
                 key: EntityKey {
-                    subgraph_id: self.site.deployment.cheap_clone(),
                     entity_type,
                     entity_id,
                 },
@@ -561,14 +565,13 @@ impl Layout {
 
         for del in &deletions {
             let entity_type = del.entity_type();
-            let entity_id = del.id().to_string();
+            let entity_id = Word::from(del.id());
 
             // See the doc comment of `FindPossibleDeletionsQuery` for details
             // about why this check is necessary.
             if !processed_entities.contains(&(entity_type.clone(), entity_id.clone())) {
                 changes.push(EntityOperation::Remove {
                     key: EntityKey {
-                        subgraph_id: self.site.deployment.cheap_clone(),
                         entity_type,
                         entity_id,
                     },
@@ -626,21 +629,23 @@ impl Layout {
         range: EntityRange,
         block: BlockNumber,
         query_id: Option<String>,
-    ) -> Result<Vec<T>, QueryExecutionError> {
+    ) -> Result<(Vec<T>, Trace), QueryExecutionError> {
         fn log_query_timing(
             logger: &Logger,
             query: &FilterQuery,
             elapsed: Duration,
             entity_count: usize,
-        ) {
+        ) -> Trace {
             // 20kB
             const MAXLEN: usize = 20_480;
 
             if !ENV_VARS.log_sql_timing() {
-                return;
+                return Trace::None;
             }
 
             let mut text = debug_query(&query).to_string().replace("\n", "\t");
+            let trace = Trace::query(&text, elapsed, entity_count);
+
             // If the query + bind variables is more than MAXLEN, truncate it;
             // this will happen when queries have very large bind variables
             // (e.g., long arrays of string ids)
@@ -655,9 +660,10 @@ impl Layout {
                 "time_ms" => elapsed.as_millis(),
                 "entity_count" => entity_count
             );
+            trace
         }
 
-        let filter_collection = FilterCollection::new(self, collection, filter.as_ref())?;
+        let filter_collection = FilterCollection::new(self, collection, filter.as_ref(), block)?;
         let query = FilterQuery::new(
             &filter_collection,
             filter.as_ref(),
@@ -702,17 +708,18 @@ impl Layout {
                     )),
                 }
             })?;
-        log_query_timing(logger, &query_clone, start.elapsed(), values.len());
+        let trace = log_query_timing(logger, &query_clone, start.elapsed(), values.len());
 
         let parent_type = filter_collection.parent_type()?.map(ColumnType::from);
         values
             .into_iter()
             .map(|entity_data| {
                 entity_data
-                    .deserialize_with_layout(self, parent_type.as_ref())
+                    .deserialize_with_layout(self, parent_type.as_ref(), false)
                     .map_err(|e| e.into())
             })
-            .collect()
+            .collect::<Result<Vec<T>, _>>()
+            .map(|values| (values, trace))
     }
 
     pub fn update<'a>(

@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use graph::blockchain::block_stream::FirehoseCursor;
 use graph::blockchain::BlockPtr;
 use graph::data::subgraph::schema::{SubgraphError, SubgraphHealth};
 use graph::prelude::{Schema, StopwatchMetrics, StoreError, UnfailOutcome};
@@ -7,10 +8,12 @@ use slog::Logger;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use graph::components::store::{EntityType, StoredDynamicDataSource, WritableStore};
+use graph::components::store::{
+    EntityKey, EntityType, ReadStore, StoredDynamicDataSource, WritableStore,
+};
 use graph::{
     components::store::{DeploymentId, DeploymentLocator},
-    prelude::{anyhow, DeploymentHash, Entity, EntityCache, EntityKey, EntityModification, Value},
+    prelude::{anyhow, DeploymentHash, Entity, EntityCache, EntityModification, Value},
 };
 
 lazy_static! {
@@ -43,18 +46,39 @@ impl MockStore {
     }
 }
 
-// The store trait must be implemented manually because mockall does not support async_trait, nor borrowing from arguments.
+impl ReadStore for MockStore {
+    fn get(&self, key: &EntityKey) -> Result<Option<Entity>, StoreError> {
+        match self.get_many_res.get(&key.entity_type) {
+            Some(entities) => Ok(entities
+                .iter()
+                .find(|entity| entity.id().ok().as_deref() == Some(key.entity_id.as_str()))
+                .cloned()),
+            None => Err(StoreError::Unknown(anyhow!(
+                "nothing for type {}",
+                key.entity_type
+            ))),
+        }
+    }
+
+    fn get_many(
+        &self,
+        _ids_for_type: BTreeMap<&EntityType, Vec<&str>>,
+    ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError> {
+        Ok(self.get_many_res.clone())
+    }
+
+    fn input_schema(&self) -> Arc<Schema> {
+        SCHEMA.clone()
+    }
+}
+
 #[async_trait]
 impl WritableStore for MockStore {
-    async fn block_ptr(&self) -> Option<BlockPtr> {
+    fn block_ptr(&self) -> Option<BlockPtr> {
         unimplemented!()
     }
 
-    async fn block_cursor(&self) -> Option<String> {
-        unimplemented!()
-    }
-
-    async fn delete_block_cursor(&self) -> Result<(), StoreError> {
+    fn block_cursor(&self) -> FirehoseCursor {
         unimplemented!()
     }
 
@@ -65,12 +89,12 @@ impl WritableStore for MockStore {
     async fn revert_block_operations(
         &self,
         _: BlockPtr,
-        _: Option<&str>,
+        _: FirehoseCursor,
     ) -> Result<(), StoreError> {
         unimplemented!()
     }
 
-    fn unfail_deterministic_error(
+    async fn unfail_deterministic_error(
         &self,
         _: &BlockPtr,
         _: &BlockPtr,
@@ -90,36 +114,18 @@ impl WritableStore for MockStore {
         unimplemented!()
     }
 
-    fn get(&self, key: &EntityKey) -> Result<Option<Entity>, StoreError> {
-        match self.get_many_res.get(&key.entity_type) {
-            Some(entities) => Ok(entities
-                .iter()
-                .find(|entity| entity.id().ok().as_ref() == Some(&key.entity_id))
-                .cloned()),
-            None => Err(StoreError::Unknown(anyhow!(
-                "nothing for type {}",
-                key.entity_type
-            ))),
-        }
-    }
-
     async fn transact_block_operations(
         &self,
         _: BlockPtr,
-        _: Option<String>,
+        _: FirehoseCursor,
         _: Vec<EntityModification>,
         _: &StopwatchMetrics,
         _: Vec<StoredDynamicDataSource>,
         _: Vec<SubgraphError>,
+        _: Vec<(u32, String)>,
+        _: Vec<StoredDynamicDataSource>,
     ) -> Result<(), StoreError> {
         unimplemented!()
-    }
-
-    fn get_many(
-        &self,
-        _ids_for_type: BTreeMap<&EntityType, Vec<&str>>,
-    ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError> {
-        Ok(self.get_many_res.clone())
     }
 
     async fn is_deployment_synced(&self) -> Result<bool, StoreError> {
@@ -130,7 +136,10 @@ impl WritableStore for MockStore {
         unimplemented!()
     }
 
-    async fn load_dynamic_data_sources(&self) -> Result<Vec<StoredDynamicDataSource>, StoreError> {
+    async fn load_dynamic_data_sources(
+        &self,
+        _manifest_idx_and_name: Vec<(u32, String)>,
+    ) -> Result<Vec<StoredDynamicDataSource>, StoreError> {
         unimplemented!()
     }
 
@@ -142,12 +151,8 @@ impl WritableStore for MockStore {
         unimplemented!()
     }
 
-    async fn health(&self, _: &DeploymentHash) -> Result<SubgraphHealth, StoreError> {
+    async fn health(&self) -> Result<SubgraphHealth, StoreError> {
         unimplemented!()
-    }
-
-    fn input_schema(&self) -> Arc<Schema> {
-        SCHEMA.clone()
     }
 
     async fn flush(&self) -> Result<(), StoreError> {
@@ -157,13 +162,16 @@ impl WritableStore for MockStore {
 
 fn make_band(id: &'static str, data: Vec<(&str, Value)>) -> (EntityKey, Entity) {
     (
-        EntityKey::data(SUBGRAPH_ID.clone(), "Band".to_string(), id.into()),
+        EntityKey {
+            entity_type: EntityType::new("Band".to_string()),
+            entity_id: id.into(),
+        },
         Entity::from(data),
     )
 }
 
 fn sort_by_entity_key(mut mods: Vec<EntityModification>) -> Vec<EntityModification> {
-    mods.sort_by_key(|m| m.entity_key().clone());
+    mods.sort_by_key(|m| m.entity_ref().clone());
     mods
 }
 

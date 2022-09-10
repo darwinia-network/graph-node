@@ -1,7 +1,8 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::chain::create_firehose_networks;
 use crate::config::{Config, ProviderDetails};
 use crate::manager::PanicSubscriptionManager;
 use crate::store_builder::StoreBuilder;
@@ -15,18 +16,19 @@ use graph::blockchain::{BlockchainKind, BlockchainMap, ChainIdentifier};
 use graph::cheap_clone::CheapClone;
 use graph::components::store::{BlockStore as _, DeploymentLocator};
 use graph::env::EnvVars;
-use graph::firehose::{FirehoseEndpoint, FirehoseEndpoints, FirehoseNetworks};
+use graph::firehose::FirehoseEndpoints;
 use graph::ipfs_client::IpfsClient;
-use graph::prelude::MetricsRegistry as MetricsRegistryTrait;
 use graph::prelude::{
-    anyhow, tokio, BlockNumber, DeploymentHash, LoggerFactory, NodeId, SubgraphAssignmentProvider,
-    SubgraphName, SubgraphRegistrar, SubgraphStore, SubgraphVersionSwitchingMode, ENV_VARS,
+    anyhow, tokio, BlockNumber, DeploymentHash, LoggerFactory,
+    MetricsRegistry as MetricsRegistryTrait, NodeId, SubgraphAssignmentProvider, SubgraphName,
+    SubgraphRegistrar, SubgraphStore, SubgraphVersionSwitchingMode, ENV_VARS,
 };
 use graph::slog::{debug, error, info, o, Logger};
 use graph::util::security::SafeDisplay;
 use graph_chain_ethereum::{self as ethereum, EthereumAdapterTrait, Transport};
+use graph_core::polling_monitor::ipfs_service::IpfsService;
 use graph_core::{
-    LinkResolver, MetricsRegistry, SubgraphAssignmentProvider as IpfsSubgraphAssignmentProvider,
+    LinkResolver, SubgraphAssignmentProvider as IpfsSubgraphAssignmentProvider,
     SubgraphInstanceManager, SubgraphRegistrar as IpfsSubgraphRegistrar,
 };
 use url::Url;
@@ -61,6 +63,13 @@ pub async fn run(
 
     // FIXME: Hard-coded IPFS config, take it from config file instead?
     let ipfs_clients: Vec<_> = create_ipfs_clients(&logger, &ipfs_url);
+    let ipfs_client = ipfs_clients.first().cloned().expect("Missing IPFS client");
+    let ipfs_service = IpfsService::new(
+        ipfs_client,
+        ENV_VARS.mappings.max_ipfs_file_bytes as u64,
+        ENV_VARS.mappings.ipfs_timeout,
+        ENV_VARS.mappings.max_ipfs_concurrent_requests,
+    );
 
     // Convert the clients into a link resolver. Since we want to get past
     // possible temporary DNS failures, make the resolver retry
@@ -69,13 +78,15 @@ pub async fn run(
         Arc::new(EnvVars::default()),
     ));
 
-    let eth_networks = create_ethereum_networks(logger.clone(), metrics_registry.clone(), &config)
-        .await
-        .expect("Failed to parse Ethereum networks");
-    let firehose_networks_by_kind =
-        create_firehose_networks(logger.clone(), metrics_registry.clone(), &config)
-            .await
-            .expect("Failed to parse Firehose endpoints");
+    let eth_networks = create_ethereum_networks(
+        logger.clone(),
+        metrics_registry.clone(),
+        &config,
+        &network_name,
+    )
+    .await
+    .expect("Failed to parse Ethereum networks");
+    let firehose_networks_by_kind = create_firehose_networks(logger.clone(), &config);
     let firehose_networks = firehose_networks_by_kind.get(&BlockchainKind::Ethereum);
     let firehose_endpoints = firehose_networks
         .and_then(|v| v.networks.get(&network_name))
@@ -150,6 +161,7 @@ pub async fn run(
         blockchain_map.clone(),
         metrics_registry.clone(),
         link_resolver.cheap_clone(),
+        ipfs_service,
         static_filters,
     );
 
@@ -205,6 +217,7 @@ pub async fn run(
         node_id.clone(),
         None,
         None,
+        None,
     )
     .await?;
 
@@ -232,11 +245,6 @@ pub async fn run(
             break;
         }
     }
-
-    // FIXME: wait for instance manager to stop.
-    // If we remove the subgraph first, it will panic on:
-    // 1504c9d8-36e4-45bb-b4f2-71cf58789ed9
-    tokio::time::sleep(Duration::from_millis(4000)).await;
 
     info!(&logger, "Removing subgraph {}", name);
     subgraph_store.clone().remove_subgraph(subgraph_name)?;
@@ -347,18 +355,20 @@ fn create_ipfs_clients(logger: &Logger, ipfs_addresses: &Vec<String>) -> Vec<Ipf
 }
 
 /// Parses an Ethereum connection string and returns the network name and Ethereum adapter.
-async fn create_ethereum_networks(
+pub async fn create_ethereum_networks(
     logger: Logger,
-    registry: Arc<MetricsRegistry>,
+    registry: Arc<dyn MetricsRegistryTrait>,
     config: &Config,
+    network_name: &str,
 ) -> Result<EthereumNetworks, anyhow::Error> {
     let eth_rpc_metrics = Arc::new(ProviderEthRpcMetrics::new(registry));
     let mut parsed_networks = EthereumNetworks::new();
-    for (name, chain) in &config.chains.chains {
-        if chain.protocol != BlockchainKind::Ethereum {
-            continue;
-        }
-
+    let chain = config
+        .chains
+        .chains
+        .get(network_name)
+        .ok_or_else(|| anyhow!("unknown network {}", network_name))?;
+    if chain.protocol == BlockchainKind::Ethereum {
         for provider in &chain.providers {
             if let ProviderDetails::Web3(web3) = &provider.details {
                 let capabilities = web3.node_capabilities();
@@ -382,7 +392,7 @@ async fn create_ethereum_networks(
                 let supports_eip_1898 = !web3.features.contains("no_eip1898");
 
                 parsed_networks.insert(
-                    name.to_string(),
+                    network_name.to_string(),
                     capabilities,
                     Arc::new(
                         graph_chain_ethereum::EthereumAdapter::new(
@@ -395,56 +405,13 @@ async fn create_ethereum_networks(
                         )
                         .await,
                     ),
+                    web3.limit_for(&config.node),
                 );
             }
         }
     }
     parsed_networks.sort();
     Ok(parsed_networks)
-}
-
-async fn create_firehose_networks(
-    logger: Logger,
-    _registry: Arc<dyn MetricsRegistryTrait>,
-    config: &Config,
-) -> Result<BTreeMap<BlockchainKind, FirehoseNetworks>, anyhow::Error> {
-    debug!(
-        logger,
-        "Creating firehose networks [{} chains, ingestor {}]",
-        config.chains.chains.len(),
-        config.chains.ingestor,
-    );
-
-    let mut networks_by_kind = BTreeMap::new();
-
-    for (name, chain) in &config.chains.chains {
-        for provider in &chain.providers {
-            if let ProviderDetails::Firehose(ref firehose) = provider.details {
-                let logger = logger.new(o!("provider" => provider.label.clone()));
-                info!(
-                    logger,
-                    "Creating firehose endpoint";
-                    "url" => &firehose.url,
-                );
-
-                let endpoint = FirehoseEndpoint::new(
-                    logger,
-                    &provider.label,
-                    &firehose.url,
-                    firehose.token.clone(),
-                    firehose.filters_enabled(),
-                )
-                .await?;
-
-                let parsed_networks = networks_by_kind
-                    .entry(chain.protocol)
-                    .or_insert_with(|| FirehoseNetworks::new());
-                parsed_networks.insert(name.to_string(), Arc::new(endpoint));
-            }
-        }
-    }
-
-    Ok(networks_by_kind)
 }
 
 /// Try to connect to all the providers in `eth_networks` and get their net

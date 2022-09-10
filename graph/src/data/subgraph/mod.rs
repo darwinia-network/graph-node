@@ -14,8 +14,7 @@ use anyhow::ensure;
 use anyhow::{anyhow, Error};
 use futures03::{future::try_join3, stream::FuturesOrdered, TryStreamExt as _};
 use semver::Version;
-use serde::de;
-use serde::ser;
+use serde::{de, ser};
 use serde_yaml;
 use slog::{debug, info, Logger};
 use stable_hash::{FieldAddress, StableHash};
@@ -25,20 +24,24 @@ use thiserror::Error;
 use wasmparser;
 use web3::types::Address;
 
-use crate::data::store::Entity;
-use crate::data::{
-    schema::{Schema, SchemaImportError, SchemaValidationError},
-    subgraph::features::validate_subgraph_features,
-};
-use crate::prelude::{r, CheapClone, ENV_VARS};
-use crate::{blockchain::DataSource, data::graphql::TryFromValue};
-use crate::{blockchain::DataSourceTemplate as _, data::query::QueryExecutionError};
 use crate::{
-    blockchain::{Blockchain, UnresolvedDataSource as _, UnresolvedDataSourceTemplate as _},
+    blockchain::{BlockPtr, Blockchain, DataSource as _},
     components::{
         link_resolver::LinkResolver,
         store::{DeploymentLocator, StoreError, SubgraphStore},
     },
+    data::{
+        graphql::TryFromValue,
+        query::QueryExecutionError,
+        schema::{Schema, SchemaImportError, SchemaValidationError},
+        store::Entity,
+        subgraph::features::validate_subgraph_features,
+    },
+    data_source::{
+        offchain::OFFCHAIN_KINDS, DataSource, DataSourceTemplate, UnresolvedDataSource,
+        UnresolvedDataSourceTemplate,
+    },
+    prelude::{r, CheapClone, ENV_VARS},
 };
 
 use crate::prelude::{impl_slog_value, BlockNumber, Deserialize, Serialize};
@@ -62,8 +65,6 @@ where
         .map(Some)
 }
 
-// Note: This has a StableHash impl. Do not modify fields without a backward
-// compatible change to the StableHash impl (below)
 /// The IPFS hash used to identifiy a deployment externally, i.e., the
 /// `Qm..` string that `graph-cli` prints when deploying to a subgraph
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -76,13 +77,15 @@ impl stable_hash_legacy::StableHash for DeploymentHash {
         mut sequence_number: H::Seq,
         state: &mut H,
     ) {
-        stable_hash_legacy::StableHash::stable_hash(&self.0, sequence_number.next_child(), state);
+        let Self(inner) = self;
+        stable_hash_legacy::StableHash::stable_hash(inner, sequence_number.next_child(), state);
     }
 }
 
 impl StableHash for DeploymentHash {
     fn stable_hash<H: stable_hash::StableHasher>(&self, field_address: H::Addr, state: &mut H) {
-        stable_hash::StableHash::stable_hash(&self.0, field_address.child(0), state);
+        let Self(inner) = self;
+        stable_hash::StableHash::stable_hash(inner, field_address.child(0), state);
     }
 }
 
@@ -390,9 +393,11 @@ pub struct Link {
     pub link: String,
 }
 
-impl From<String> for Link {
-    fn from(s: String) -> Self {
-        Self { link: s }
+impl<S: ToString> From<S> for Link {
+    fn from(s: S) -> Self {
+        Self {
+            link: s.to_string(),
+        }
     }
 }
 
@@ -518,17 +523,13 @@ pub struct BaseSubgraphManifest<C, S, D, T> {
 type UnresolvedSubgraphManifest<C> = BaseSubgraphManifest<
     C,
     UnresolvedSchema,
-    <C as Blockchain>::UnresolvedDataSource,
-    <C as Blockchain>::UnresolvedDataSourceTemplate,
+    UnresolvedDataSource<C>,
+    UnresolvedDataSourceTemplate<C>,
 >;
 
 /// SubgraphManifest validated with IPFS links resolved
-pub type SubgraphManifest<C> = BaseSubgraphManifest<
-    C,
-    Schema,
-    <C as Blockchain>::DataSource,
-    <C as Blockchain>::DataSourceTemplate,
->;
+pub type SubgraphManifest<C> =
+    BaseSubgraphManifest<C, Schema, DataSource<C>, DataSourceTemplate<C>>;
 
 /// Unvalidated SubgraphManifest
 pub struct UnvalidatedSubgraphManifest<C: Blockchain>(SubgraphManifest<C>);
@@ -581,7 +582,7 @@ impl<C: Blockchain> UnvalidatedSubgraphManifest<C> {
             .0
             .data_sources
             .iter()
-            .filter_map(|d| d.network().map(|n| n.to_string()))
+            .filter_map(|d| Some(d.as_onchain()?.network()?.to_string()))
             .collect::<Vec<String>>();
         networks.sort();
         networks.dedup();
@@ -643,35 +644,45 @@ impl<C: Blockchain> SubgraphManifest<C> {
         max_spec_version: semver::Version,
     ) -> Result<Self, SubgraphManifestResolveError> {
         // Inject the IPFS hash as the ID of the subgraph into the definition.
-        raw.insert(
-            serde_yaml::Value::from("id"),
-            serde_yaml::Value::from(id.to_string()),
-        );
+        raw.insert("id".into(), id.to_string().into());
 
         // Parse the YAML data into an UnresolvedSubgraphManifest
         let unresolved: UnresolvedSubgraphManifest<C> = serde_yaml::from_value(raw.into())?;
 
         debug!(logger, "Features {:?}", unresolved.features);
 
-        unresolved
+        let resolved = unresolved
             .resolve(resolver, logger, max_spec_version)
             .await
-            .map_err(SubgraphManifestResolveError::ResolveError)
+            .map_err(SubgraphManifestResolveError::ResolveError)?;
+
+        if (resolved.spec_version < SPEC_VERSION_0_0_7)
+            && resolved
+                .data_sources
+                .iter()
+                .any(|ds| OFFCHAIN_KINDS.contains(&ds.kind()))
+        {
+            return Err(SubgraphManifestResolveError::ResolveError(anyhow!(
+                "Offchain data sources not supported prior to {}",
+                SPEC_VERSION_0_0_7
+            )));
+        }
+
+        Ok(resolved)
     }
 
     pub fn network_name(&self) -> String {
         // Assume the manifest has been validated, ensuring network names are homogenous
         self.data_sources
             .iter()
-            .filter_map(|d| d.network().map(|n| n.to_string()))
-            .next()
+            .find_map(|d| Some(d.as_onchain()?.network()?.to_string()))
             .expect("Validated manifest does not have a network defined on any datasource")
     }
 
     pub fn start_blocks(&self) -> Vec<BlockNumber> {
         self.data_sources
             .iter()
-            .map(|data_source| data_source.start_block())
+            .filter_map(|d| Some(d.as_onchain()?.start_block()))
             .collect()
     }
 
@@ -682,11 +693,15 @@ impl<C: Blockchain> SubgraphManifest<C> {
             .chain(self.data_sources.iter().map(|source| source.api_version()))
     }
 
-    pub fn runtimes(&self) -> impl Iterator<Item = &[u8]> + '_ {
+    pub fn runtimes(&self) -> impl Iterator<Item = Arc<Vec<u8>>> + '_ {
         self.templates
             .iter()
-            .map(|template| template.runtime())
-            .chain(self.data_sources.iter().map(|source| source.runtime()))
+            .filter_map(|template| template.runtime())
+            .chain(
+                self.data_sources
+                    .iter()
+                    .filter_map(|source| source.runtime()),
+            )
     }
 
     pub fn unified_mapping_api_version(
@@ -726,16 +741,27 @@ impl<C: Blockchain> UnresolvedSubgraphManifest<C> {
             ));
         }
 
+        let ds_count = data_sources.len();
+        if ds_count as u64 + templates.len() as u64 > u32::MAX as u64 {
+            return Err(anyhow!(
+                "Subgraph has too many declared data sources and templates",
+            ));
+        }
+
         let (schema, data_sources, templates) = try_join3(
             schema.resolve(id.clone(), &resolver, logger),
             data_sources
                 .into_iter()
-                .map(|ds| ds.resolve(&resolver, logger))
+                .enumerate()
+                .map(|(idx, ds)| ds.resolve(&resolver, logger, idx as u32))
                 .collect::<FuturesOrdered<_>>()
                 .try_collect::<Vec<_>>(),
             templates
                 .into_iter()
-                .map(|template| template.resolve(&resolver, logger))
+                .enumerate()
+                .map(|(idx, template)| {
+                    template.resolve(&resolver, logger, ds_count as u32 + idx as u32)
+                })
                 .collect::<FuturesOrdered<_>>()
                 .try_collect::<Vec<_>>(),
         )
@@ -783,14 +809,34 @@ pub struct DeploymentState {
     /// The maximum number of blocks we ever reorged without moving a block
     /// forward in between
     pub max_reorg_depth: u32,
-    /// The number of the last block that the subgraph has processed
-    pub latest_ethereum_block_number: BlockNumber,
+    /// The last block that the subgraph has processed
+    pub latest_block: BlockPtr,
+    /// The earliest block that the subgraph has processed
+    pub earliest_block_number: BlockNumber,
 }
 
 impl DeploymentState {
     /// Is this subgraph deployed and has it processed any blocks?
     pub fn is_deployed(&self) -> bool {
-        self.latest_ethereum_block_number > 0
+        self.latest_block.number > 0
+    }
+
+    pub fn block_queryable(&self, block: BlockNumber) -> Result<(), String> {
+        if block > self.latest_block.number {
+            return Err(format!(
+                "subgraph {} has only indexed up to block number {} \
+                        and data for block number {} is therefore not yet available",
+                self.id, self.latest_block.number, block
+            ));
+        }
+        if block < self.earliest_block_number {
+            return Err(format!(
+                "subgraph {} only has data starting at block number {} \
+                            and data for block number {} is therefore not available",
+                self.id, self.earliest_block_number, block
+            ));
+        }
+        Ok(())
     }
 }
 

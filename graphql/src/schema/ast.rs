@@ -33,6 +33,7 @@ pub(crate) enum FilterOp {
     NotEndsWith,
     NotEndsWithNoCase,
     Equal,
+    Child,
 }
 
 /// Split a "name_eq" style name into an attribute ("name") and a filter op (`Equal`).
@@ -65,6 +66,7 @@ pub(crate) fn parse_field_as_filter(key: &str) -> (String, FilterOp) {
         }
         k if k.ends_with("_ends_with") => ("_ends_with", FilterOp::EndsWith),
         k if k.ends_with("_ends_with_nocase") => ("_ends_with_nocase", FilterOp::EndsWithNoCase),
+        k if k.ends_with("_") => ("_", FilterOp::Child),
         _ => ("", FilterOp::Equal),
     };
 
@@ -397,8 +399,9 @@ pub fn is_list(field_type: &s::Type) -> bool {
 
 #[test]
 fn entity_validation() {
+    use graph::components::store::EntityKey;
     use graph::data::store;
-    use graph::prelude::{DeploymentHash, Entity, EntityKey};
+    use graph::prelude::{DeploymentHash, Entity};
 
     fn make_thing(name: &str) -> Entity {
         let mut thing = Entity::new();
@@ -432,11 +435,7 @@ fn entity_validation() {
         let schema =
             graph::prelude::Schema::parse(DOCUMENT, subgraph).expect("Failed to parse test schema");
         let id = thing.id().unwrap_or("none".to_owned());
-        let key = EntityKey::data(
-            DeploymentHash::new("doesntmatter").unwrap(),
-            "Thing".to_owned(),
-            id.to_owned(),
-        );
+        let key = EntityKey::data("Thing".to_owned(), id.clone());
 
         let err = thing.validate(&schema, &key);
         if errmsg == "" {

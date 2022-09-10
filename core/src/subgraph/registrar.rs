@@ -7,6 +7,7 @@ use graph::blockchain::BlockchainKind;
 use graph::blockchain::BlockchainMap;
 use graph::components::store::{DeploymentId, DeploymentLocator, SubscriptionManager};
 use graph::data::subgraph::schema::DeploymentCreate;
+use graph::data::subgraph::Graft;
 use graph::prelude::{
     CreateSubgraphResult, SubgraphAssignmentProvider as SubgraphAssignmentProviderTrait,
     SubgraphRegistrar as SubgraphRegistrarTrait, *,
@@ -267,8 +268,9 @@ where
         hash: DeploymentHash,
         node_id: NodeId,
         debug_fork: Option<DeploymentHash>,
-        start_block: Option<BlockPtr>,
-    ) -> Result<(), SubgraphRegistrarError> {
+        start_block_override: Option<BlockPtr>,
+        graft_block_override: Option<BlockPtr>,
+    ) -> Result<DeploymentLocator, SubgraphRegistrarError> {
         // We don't have a location for the subgraph yet; that will be
         // assigned when we deploy for real. For logging purposes, make up a
         // fake locator
@@ -295,7 +297,7 @@ where
             SubgraphRegistrarError::ResolveError(SubgraphManifestResolveError::ResolveError(e))
         })?;
 
-        match kind {
+        let deployment_locator = match kind {
             BlockchainKind::Arweave => {
                 create_subgraph_version::<graph_chain_arweave::Chain, _>(
                     &logger,
@@ -303,7 +305,8 @@ where
                     self.chains.cheap_clone(),
                     name.clone(),
                     hash.cheap_clone(),
-                    start_block,
+                    start_block_override,
+                    graft_block_override,
                     raw,
                     node_id,
                     debug_fork,
@@ -312,7 +315,6 @@ where
                 )
                 .await?
             }
-
             BlockchainKind::Ethereum => {
                 create_subgraph_version::<graph_chain_ethereum::Chain, _>(
                     &logger,
@@ -320,7 +322,8 @@ where
                     self.chains.cheap_clone(),
                     name.clone(),
                     hash.cheap_clone(),
-                    start_block,
+                    start_block_override,
+                    graft_block_override,
                     raw,
                     node_id,
                     debug_fork,
@@ -329,7 +332,6 @@ where
                 )
                 .await?
             }
-
             BlockchainKind::Near => {
                 create_subgraph_version::<graph_chain_near::Chain, _>(
                     &logger,
@@ -337,7 +339,8 @@ where
                     self.chains.cheap_clone(),
                     name.clone(),
                     hash.cheap_clone(),
-                    start_block,
+                    start_block_override,
+                    graft_block_override,
                     raw,
                     node_id,
                     debug_fork,
@@ -346,7 +349,6 @@ where
                 )
                 .await?
             }
-
             BlockchainKind::Cosmos => {
                 create_subgraph_version::<graph_chain_cosmos::Chain, _>(
                     &logger,
@@ -354,7 +356,25 @@ where
                     self.chains.cheap_clone(),
                     name.clone(),
                     hash.cheap_clone(),
-                    start_block,
+                    start_block_override,
+                    graft_block_override,
+                    raw,
+                    node_id,
+                    debug_fork,
+                    self.version_switching_mode,
+                    &self.resolver,
+                )
+                .await?
+            }
+            BlockchainKind::Substreams => {
+                create_subgraph_version::<graph_chain_substreams::Chain, _>(
+                    &logger,
+                    self.store.clone(),
+                    self.chains.cheap_clone(),
+                    name.clone(),
+                    hash.cheap_clone(),
+                    start_block_override,
+                    graft_block_override,
                     raw,
                     node_id,
                     debug_fork,
@@ -372,7 +392,7 @@ where
             "subgraph_hash" => hash.to_string(),
         );
 
-        Ok(())
+        Ok(deployment_locator)
     }
 
     async fn remove_subgraph(&self, name: SubgraphName) -> Result<(), SubgraphRegistrarError> {
@@ -471,25 +491,22 @@ async fn start_subgraph(
     }
 }
 
-/// Resolves the subgraph's earliest block and the manifest's graft base block
-async fn resolve_subgraph_chain_blocks(
+/// Resolves the subgraph's earliest block
+async fn resolve_start_block(
     manifest: &SubgraphManifest<impl Blockchain>,
-    chain: Arc<impl Blockchain>,
+    chain: &impl Blockchain,
     logger: &Logger,
-) -> Result<(Option<BlockPtr>, Option<(DeploymentHash, BlockPtr)>), SubgraphRegistrarError> {
-    let logger1 = logger.clone();
-    let graft = manifest.graft.clone();
-
+) -> Result<Option<BlockPtr>, SubgraphRegistrarError> {
     // If the minimum start block is 0 (i.e. the genesis block),
     // return `None` to start indexing from the genesis block. Otherwise
     // return a block pointer for the block with number `min_start_block - 1`.
-    let start_block_ptr = match manifest
+    match manifest
         .start_blocks()
         .into_iter()
         .min()
         .expect("cannot identify minimum start block because there are no data sources")
     {
-        0 => None,
+        0 => Ok(None),
         min_start_block => chain
             .block_pointer_from_number(logger, min_start_block - 1)
             .await
@@ -498,31 +515,27 @@ async fn resolve_subgraph_chain_blocks(
                 SubgraphRegistrarError::ManifestValidationError(vec![
                     SubgraphManifestValidationError::BlockNotFound(min_start_block.to_string()),
                 ])
-            })?,
-    };
+            }),
+    }
+}
 
-    let base_ptr = {
-        match graft {
-            None => None,
-            Some(base) => {
-                let base_block = base.block;
-
-                chain
-                    .block_pointer_from_number(&logger1, base.block)
-                    .await
-                    .map(|ptr| Some((base.base, ptr)))
-                    .map_err(move |_| {
-                        SubgraphRegistrarError::ManifestValidationError(vec![
-                            SubgraphManifestValidationError::BlockNotFound(format!(
-                                "graft base block {} not found",
-                                base_block
-                            )),
-                        ])
-                    })?
-            }
-        }
-    };
-    Ok((start_block_ptr, base_ptr))
+/// Resolves the manifest's graft base block
+async fn resolve_graft_block(
+    base: &Graft,
+    chain: &impl Blockchain,
+    logger: &Logger,
+) -> Result<BlockPtr, SubgraphRegistrarError> {
+    chain
+        .block_pointer_from_number(logger, base.block)
+        .await
+        .map_err(|_| {
+            SubgraphRegistrarError::ManifestValidationError(vec![
+                SubgraphManifestValidationError::BlockNotFound(format!(
+                    "graft base block {} not found",
+                    base.block
+                )),
+            ])
+        })
 }
 
 async fn create_subgraph_version<C: Blockchain, S: SubgraphStore>(
@@ -531,13 +544,14 @@ async fn create_subgraph_version<C: Blockchain, S: SubgraphStore>(
     chains: Arc<BlockchainMap>,
     name: SubgraphName,
     deployment: DeploymentHash,
-    start_block_ptr: Option<BlockPtr>,
+    start_block_override: Option<BlockPtr>,
+    graft_block_override: Option<BlockPtr>,
     raw: serde_yaml::Mapping,
     node_id: NodeId,
     debug_fork: Option<DeploymentHash>,
     version_switching_mode: SubgraphVersionSwitchingMode,
     resolver: &Arc<dyn LinkResolver>,
-) -> Result<(), SubgraphRegistrarError> {
+) -> Result<DeploymentLocator, SubgraphRegistrarError> {
     let unvalidated = UnvalidatedSubgraphManifest::<C>::resolve(
         deployment,
         raw,
@@ -573,12 +587,20 @@ async fn create_subgraph_version<C: Blockchain, S: SubgraphStore>(
         return Err(SubgraphRegistrarError::NameNotFound(name.to_string()));
     }
 
-    let (manifest_start_block, base_block) =
-        resolve_subgraph_chain_blocks(&manifest, chain, &logger.clone()).await?;
-
-    let start_block = match start_block_ptr {
+    let start_block = match start_block_override {
         Some(block) => Some(block),
-        None => manifest_start_block,
+        None => resolve_start_block(&manifest, &*chain, &logger).await?,
+    };
+
+    let base_block = match &manifest.graft {
+        None => None,
+        Some(graft) => Some((
+            graft.base.clone(),
+            match graft_block_override {
+                Some(block) => block,
+                None => resolve_graft_block(&graft, &*chain, &logger).await?,
+            },
+        )),
     };
 
     info!(
@@ -609,5 +631,4 @@ async fn create_subgraph_version<C: Blockchain, S: SubgraphStore>(
             version_switching_mode,
         )
         .map_err(|e| SubgraphRegistrarError::SubgraphDeploymentError(e))
-        .map(|_| ())
 }

@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use graph::data::subgraph::schema::SubgraphError;
-use graph::data::subgraph::SPEC_VERSION_0_0_4;
+use graph::data::subgraph::{SPEC_VERSION_0_0_4, SPEC_VERSION_0_0_7};
+use graph::data_source::DataSourceTemplate;
 use graph::prelude::{
     anyhow, async_trait, serde_yaml, tokio, DeploymentHash, Entity, Link, Logger, SubgraphManifest,
     SubgraphManifestValidationError, UnvalidatedSubgraphManifest,
@@ -18,12 +19,15 @@ use graph::{
 };
 
 use graph_chain_ethereum::{Chain, NodeCapabilities};
+use semver::Version;
 use test_store::LOGGER;
 
 const GQL_SCHEMA: &str = "type Thing @entity { id: ID! }";
 const GQL_SCHEMA_FULLTEXT: &str = include_str!("full-text.graphql");
 const MAPPING_WITH_IPFS_FUNC_WASM: &[u8] = include_bytes!("ipfs-on-ethereum-contracts.wasm");
 const ABI: &str = "[{\"type\":\"function\", \"inputs\": [{\"name\": \"i\",\"type\": \"uint256\"}],\"name\":\"get\",\"outputs\": [{\"type\": \"address\",\"name\": \"o\"}]}]";
+const FILE: &str = "{}";
+const FILE_CID: &str = "bafkreigkhuldxkyfkoaye4rgcqcwr45667vkygd45plwq6hawy7j4rbdky";
 
 #[derive(Default, Debug, Clone)]
 struct TextResolver {
@@ -69,7 +73,10 @@ impl LinkResolverTrait for TextResolver {
     }
 }
 
-async fn resolve_manifest(text: &str) -> SubgraphManifest<graph_chain_ethereum::Chain> {
+async fn resolve_manifest(
+    text: &str,
+    max_spec_version: Version,
+) -> SubgraphManifest<graph_chain_ethereum::Chain> {
     let mut resolver = TextResolver::default();
     let id = DeploymentHash::new("Qmmanifest").unwrap();
 
@@ -77,11 +84,12 @@ async fn resolve_manifest(text: &str) -> SubgraphManifest<graph_chain_ethereum::
     resolver.add("/ipfs/Qmschema", &GQL_SCHEMA);
     resolver.add("/ipfs/Qmabi", &ABI);
     resolver.add("/ipfs/Qmmapping", &MAPPING_WITH_IPFS_FUNC_WASM);
+    resolver.add(FILE_CID, &FILE);
 
     let resolver: Arc<dyn LinkResolverTrait> = Arc::new(resolver);
 
     let raw = serde_yaml::from_str(text).unwrap();
-    SubgraphManifest::resolve_from_raw(id, raw, &resolver, &LOGGER, SPEC_VERSION_0_0_4.clone())
+    SubgraphManifest::resolve_from_raw(id, raw, &resolver, &LOGGER, max_spec_version)
         .await
         .expect("Parsing simple manifest works")
 }
@@ -114,10 +122,42 @@ schema:
 specVersion: 0.0.2
 ";
 
-    let manifest = resolve_manifest(YAML).await;
+    let manifest = resolve_manifest(YAML, SPEC_VERSION_0_0_4).await;
 
     assert_eq!("Qmmanifest", manifest.id.as_str());
     assert!(manifest.graft.is_none());
+}
+
+#[tokio::test]
+async fn ipfs_manifest() {
+    let yaml = "
+schema:
+  file:
+    /: /ipfs/Qmschema
+dataSources: []
+templates:
+  - name: IpfsSource
+    kind: file/ipfs
+    mapping:
+      apiVersion: 0.0.6
+      language: wasm/assemblyscript
+      entities:
+        - TestEntity
+      file:
+        /: /ipfs/Qmmapping
+      handler: handleFile
+specVersion: 0.0.7
+";
+
+    let manifest = resolve_manifest(&yaml, SPEC_VERSION_0_0_7).await;
+
+    assert_eq!("Qmmanifest", manifest.id.as_str());
+    assert_eq!(manifest.data_sources.len(), 0);
+    let data_source = match &manifest.templates[0] {
+        DataSourceTemplate::Offchain(ds) => ds,
+        DataSourceTemplate::Onchain(_) => unreachable!(),
+    };
+    assert_eq!(data_source.kind, "file/ipfs");
 }
 
 #[tokio::test]
@@ -133,7 +173,7 @@ graft:
 specVersion: 0.0.2
 ";
 
-    let manifest = resolve_manifest(YAML).await;
+    let manifest = resolve_manifest(YAML, SPEC_VERSION_0_0_4).await;
 
     assert_eq!("Qmmanifest", manifest.id.as_str());
     let graft = manifest.graft.expect("The manifest has a graft base");
@@ -208,7 +248,7 @@ specVersion: 0.0.2
         );
 
         // Resolve the graft normally.
-        let manifest = resolve_manifest(YAML).await;
+        let manifest = resolve_manifest(YAML, SPEC_VERSION_0_0_4).await;
 
         assert_eq!("Qmmanifest", manifest.id.as_str());
         let graft = manifest.graft.expect("The manifest has a graft base");
@@ -355,8 +395,13 @@ schema:
 specVersion: 0.0.2
 ";
 
-    let manifest = resolve_manifest(YAML).await;
-    let required_capabilities = NodeCapabilities::from_data_sources(&manifest.data_sources);
+    let manifest = resolve_manifest(YAML, SPEC_VERSION_0_0_4).await;
+    let onchain_data_sources = manifest
+        .data_sources
+        .iter()
+        .filter_map(|ds| ds.as_onchain().cloned())
+        .collect::<Vec<_>>();
+    let required_capabilities = NodeCapabilities::from_data_sources(&onchain_data_sources);
 
     assert_eq!("Qmmanifest", manifest.id.as_str());
     assert_eq!(true, required_capabilities.traces);
@@ -426,7 +471,7 @@ graft:
                 )
             })
             .is_none());
-        let manifest = resolve_manifest(YAML).await;
+        let manifest = resolve_manifest(YAML, SPEC_VERSION_0_0_4).await;
         assert!(manifest.features.contains(&SubgraphFeature::Grafting))
     })
 }
@@ -458,7 +503,7 @@ schema:
             })
             .is_none());
 
-        let manifest = resolve_manifest(YAML).await;
+        let manifest = resolve_manifest(YAML, SPEC_VERSION_0_0_4).await;
         assert!(manifest.features.contains(&SubgraphFeature::NonFatalErrors))
     });
 }
@@ -511,7 +556,7 @@ schema:
             })
             .is_none());
 
-        let manifest = resolve_manifest(YAML).await;
+        let manifest = resolve_manifest(YAML, SPEC_VERSION_0_0_4).await;
         assert!(manifest.features.contains(&SubgraphFeature::FullTextSearch))
     });
 }
@@ -746,7 +791,7 @@ schema:
             })
             .is_none());
 
-        let manifest = resolve_manifest(YAML).await;
+        let manifest = resolve_manifest(YAML, SPEC_VERSION_0_0_4).await;
         assert!(manifest.features.contains(&SubgraphFeature::NonFatalErrors))
     });
 }

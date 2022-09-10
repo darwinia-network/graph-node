@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use async_trait::async_trait;
 
-use crate::prelude::*;
+use crate::{components::store::DeploymentLocator, prelude::*};
 
 #[derive(Clone, Copy, Debug)]
 pub enum SubgraphVersionSwitchingMode {
@@ -42,8 +42,9 @@ pub trait SubgraphRegistrar: Send + Sync + 'static {
         hash: DeploymentHash,
         assignment_node_id: NodeId,
         debug_fork: Option<DeploymentHash>,
-        start_block: Option<BlockPtr>,
-    ) -> Result<(), SubgraphRegistrarError>;
+        start_block_block: Option<BlockPtr>,
+        graft_block_override: Option<BlockPtr>,
+    ) -> Result<DeploymentLocator, SubgraphRegistrarError>;
 
     async fn remove_subgraph(&self, name: SubgraphName) -> Result<(), SubgraphRegistrarError>;
 

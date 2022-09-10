@@ -64,6 +64,8 @@ impl Default for Opt {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Config {
+    #[serde(skip, default = "default_node_id")]
+    pub node: NodeId,
     pub general: Option<GeneralSection>,
     #[serde(rename = "store")]
     pub stores: BTreeMap<String, Shard>,
@@ -148,11 +150,7 @@ impl Config {
     /// a config from the command line arguments in `opt`
     pub fn load(logger: &Logger, opt: &Opt) -> Result<Config> {
         if let Some(config) = &opt.config {
-            info!(logger, "Reading configuration file `{}`", config);
-            let config = read_to_string(config)?;
-            let mut config: Config = toml::from_str(&config)?;
-            config.validate()?;
-            Ok(config)
+            Self::from_file(logger, config, &opt.node_id)
         } else {
             info!(
                 logger,
@@ -162,12 +160,28 @@ impl Config {
         }
     }
 
+    pub fn from_file(logger: &Logger, path: &str, node: &str) -> Result<Config> {
+        info!(logger, "Reading configuration file `{}`", path);
+        Self::from_str(&read_to_string(path)?, node)
+    }
+
+    pub fn from_str(config: &str, node: &str) -> Result<Config> {
+        let mut config: Config = toml::from_str(&config)?;
+        config.node =
+            NodeId::new(node.clone()).map_err(|()| anyhow!("invalid node id {}", node))?;
+        config.validate()?;
+        Ok(config)
+    }
+
     fn from_opt(opt: &Opt) -> Result<Config> {
         let deployment = Deployment::from_opt(opt);
         let mut stores = BTreeMap::new();
         let chains = ChainSection::from_opt(opt)?;
+        let node = NodeId::new(opt.node_id.to_string())
+            .map_err(|()| anyhow!("invalid node id {}", opt.node_id))?;
         stores.insert(PRIMARY_SHARD.to_string(), Shard::from_opt(true, opt)?);
         Ok(Config {
+            node,
             general: None,
             stores,
             chains,
@@ -175,7 +189,7 @@ impl Config {
         })
     }
 
-    /// Genrate a JSON representation of the config.
+    /// Generate a JSON representation of the config.
     pub fn to_json(&self) -> Result<String> {
         // It would be nice to produce a TOML representation, but that runs
         // into this error: https://github.com/alexcrichton/toml-rs/issues/142
@@ -461,6 +475,7 @@ impl ChainSection {
                         url: url.to_string(),
                         features,
                         headers: Default::default(),
+                        rules: Vec::new(),
                     }),
                 };
                 let entry = chains.entry(name.to_string()).or_insert_with(|| Chain {
@@ -531,14 +546,22 @@ pub struct Provider {
 pub enum ProviderDetails {
     Firehose(FirehoseProvider),
     Web3(Web3Provider),
+    Substreams(FirehoseProvider),
 }
 
 const FIREHOSE_FILTER_FEATURE: &str = "filters";
 const FIREHOSE_PROVIDER_FEATURES: [&str; 1] = [FIREHOSE_FILTER_FEATURE];
+
+fn ten() -> u16 {
+    10
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct FirehoseProvider {
     pub url: String,
     pub token: Option<String>,
+    #[serde(default = "ten")]
+    pub conn_pool_size: u16,
     #[serde(default)]
     pub features: BTreeSet<String>,
 }
@@ -546,6 +569,28 @@ pub struct FirehoseProvider {
 impl FirehoseProvider {
     pub fn filters_enabled(&self) -> bool {
         self.features.contains(FIREHOSE_FILTER_FEATURE)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct Web3Rule {
+    #[serde(with = "serde_regex")]
+    name: Regex,
+    limit: usize,
+}
+
+impl PartialEq for Web3Rule {
+    fn eq(&self, other: &Self) -> bool {
+        self.name.to_string() == other.name.to_string() && self.limit == other.limit
+    }
+}
+
+impl Web3Rule {
+    fn limit_for(&self, node: &NodeId) -> Option<usize> {
+        match self.name.find(node.as_str()) {
+            Some(m) if m.as_str() == node.as_str() => Some(self.limit),
+            _ => None,
+        }
     }
 }
 
@@ -563,6 +608,9 @@ pub struct Web3Provider {
         deserialize_with = "deserialize_http_headers"
     )]
     pub headers: HeaderMap,
+
+    #[serde(default, rename = "match")]
+    rules: Vec<Web3Rule>,
 }
 
 impl Web3Provider {
@@ -571,6 +619,13 @@ impl Web3Provider {
             archive: self.features.contains("archive"),
             traces: self.features.contains("traces"),
         }
+    }
+
+    pub fn limit_for(&self, node: &NodeId) -> usize {
+        self.rules
+            .iter()
+            .find_map(|l| l.limit_for(node))
+            .unwrap_or(usize::MAX)
     }
 }
 
@@ -582,7 +637,8 @@ impl Provider {
         validate_name(&self.label).context("illegal provider name")?;
 
         match self.details {
-            ProviderDetails::Firehose(ref mut firehose) => {
+            ProviderDetails::Firehose(ref mut firehose)
+            | ProviderDetails::Substreams(ref mut firehose) => {
                 firehose.url = shellexpand::env(&firehose.url)?.into_owned();
 
                 // A Firehose url must be a valid Uri since gRPC library we use (Tonic)
@@ -668,6 +724,7 @@ impl<'de> Deserialize<'de> for Provider {
                 let mut transport = None;
                 let mut features = None;
                 let mut headers = None;
+                let mut nodes = Vec::new();
 
                 while let Some(key) = map.next_key()? {
                     match key {
@@ -709,6 +766,9 @@ impl<'de> Deserialize<'de> for Provider {
                             let raw_headers: BTreeMap<String, String> = map.next_value()?;
                             headers = Some(btree_map_to_http_headers(raw_headers));
                         }
+                        ProviderField::Match => {
+                            nodes = map.next_value()?;
+                        }
                     }
                 }
 
@@ -731,6 +791,7 @@ impl<'de> Deserialize<'de> for Provider {
                         features: features
                             .ok_or_else(|| serde::de::Error::missing_field("features"))?,
                         headers: headers.unwrap_or_else(|| HeaderMap::new()),
+                        rules: nodes,
                     }),
                 };
 
@@ -755,6 +816,7 @@ impl<'de> Deserialize<'de> for Provider {
 enum ProviderField {
     Label,
     Details,
+    Match,
 
     // Deprecated fields
     Url,
@@ -991,6 +1053,10 @@ fn one() -> usize {
     1
 }
 
+fn default_node_id() -> NodeId {
+    NodeId::new("default").unwrap()
+}
+
 // From https://github.com/serde-rs/serde/issues/889#issuecomment-295988865
 fn string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
@@ -1030,6 +1096,7 @@ mod tests {
         Chain, Config, FirehoseProvider, Provider, ProviderDetails, Transport, Web3Provider,
     };
     use graph::blockchain::BlockchainKind;
+    use graph::prelude::NodeId;
     use http::{HeaderMap, HeaderValue};
     use std::collections::BTreeSet;
     use std::fs::read_to_string;
@@ -1112,6 +1179,7 @@ mod tests {
                     url: "http://localhost:8545".to_owned(),
                     features: BTreeSet::new(),
                     headers: HeaderMap::new(),
+                    rules: Vec::new(),
                 }),
             },
             actual
@@ -1137,6 +1205,7 @@ mod tests {
                     url: "http://localhost:8545".to_owned(),
                     features: BTreeSet::new(),
                     headers: HeaderMap::new(),
+                    rules: Vec::new(),
                 }),
             },
             actual
@@ -1201,6 +1270,7 @@ mod tests {
                     url: "http://localhost:8545".to_owned(),
                     features,
                     headers,
+                    rules: Vec::new(),
                 }),
             },
             actual
@@ -1225,6 +1295,7 @@ mod tests {
                     url: "http://localhost:8545".to_owned(),
                     features: BTreeSet::new(),
                     headers: HeaderMap::new(),
+                    rules: Vec::new(),
                 }),
             },
             actual
@@ -1262,12 +1333,36 @@ mod tests {
                     url: "http://localhost:9000".to_owned(),
                     token: None,
                     features: BTreeSet::new(),
+                    conn_pool_size: 10,
                 }),
             },
             actual
         );
     }
 
+    #[test]
+    fn it_works_on_substreams_provider_from_toml() {
+        let actual = toml::from_str(
+            r#"
+                label = "bananas"
+                details = { type = "substreams", url = "http://localhost:9000", features = [] }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            Provider {
+                label: "bananas".to_owned(),
+                details: ProviderDetails::Substreams(FirehoseProvider {
+                    url: "http://localhost:9000".to_owned(),
+                    token: None,
+                    features: BTreeSet::new(),
+                    conn_pool_size: 10,
+                }),
+            },
+            actual
+        );
+    }
     #[test]
     fn it_works_on_new_firehose_provider_from_toml_no_features() {
         let actual = toml::from_str(
@@ -1285,6 +1380,7 @@ mod tests {
                     url: "http://localhost:9000".to_owned(),
                     token: None,
                     features: BTreeSet::new(),
+                    conn_pool_size: 10,
                 }),
             },
             actual
@@ -1309,6 +1405,28 @@ mod tests {
                     .starts_with("supported firehose endpoint filters are:")
             )
         }
+    }
+
+    #[test]
+    fn it_parses_web3_provider_rules() {
+        fn limit_for(node: &str) -> usize {
+            let prov = toml::from_str::<Web3Provider>(
+                r#"
+            label = "something"
+            url = "http://example.com"
+            features = []
+            match = [ { name = "some_node_.*", limit = 10 },
+                      { name = "other_node_.*", limit = 0 } ]
+        "#,
+            )
+            .unwrap();
+
+            prov.limit_for(&NodeId::new(node.to_string()).unwrap())
+        }
+
+        assert_eq!(10, limit_for("some_node_0"));
+        assert_eq!(0, limit_for("other_node_0"));
+        assert_eq!(usize::MAX, limit_for("default"));
     }
 
     fn read_resource_as_string<P: AsRef<Path>>(path: P) -> String {

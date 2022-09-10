@@ -1,15 +1,11 @@
-use graph::blockchain;
 use graph::blockchain::Block;
 use graph::blockchain::TriggerData;
 use graph::cheap_clone::CheapClone;
 use graph::prelude::hex;
 use graph::prelude::web3::types::H256;
 use graph::prelude::BlockNumber;
-use graph::runtime::asc_new;
-use graph::runtime::gas::GasCounter;
-use graph::runtime::AscHeap;
-use graph::runtime::AscPtr;
-use graph::runtime::DeterministicHostError;
+use graph::runtime::{asc_new, gas::GasCounter, AscHeap, AscPtr, DeterministicHostError};
+use graph_runtime_wasm::module::ToAscPtr;
 use std::{cmp::Ordering, sync::Arc};
 
 use crate::codec;
@@ -39,7 +35,7 @@ impl std::fmt::Debug for NearTrigger {
     }
 }
 
-impl blockchain::MappingTrigger for NearTrigger {
+impl ToAscPtr for NearTrigger {
     fn to_asc_ptr<H: AscHeap>(
         self,
         heap: &mut H,
@@ -155,6 +151,7 @@ mod tests {
         data::subgraph::API_VERSION_0_0_5,
         prelude::{hex, BigInt},
         runtime::gas::GasCounter,
+        util::mem::init_slice,
     };
 
     #[test]
@@ -162,8 +159,7 @@ mod tests {
         let mut heap = BytesHeap::new(API_VERSION_0_0_5);
         let trigger = NearTrigger::Block(Arc::new(block()));
 
-        let result =
-            blockchain::MappingTrigger::to_asc_ptr(trigger, &mut heap, &GasCounter::default());
+        let result = trigger.to_asc_ptr(&mut heap, &GasCounter::default());
         assert!(result.is_ok());
     }
 
@@ -176,8 +172,7 @@ mod tests {
             receipt: receipt().unwrap(),
         }));
 
-        let result =
-            blockchain::MappingTrigger::to_asc_ptr(trigger, &mut heap, &GasCounter::default());
+        let result = trigger.to_asc_ptr(&mut heap, &GasCounter::default());
         assert!(result.is_ok());
     }
 
@@ -448,12 +443,18 @@ mod tests {
             Ok((self.memory.len() - bytes.len()) as u32)
         }
 
-        fn get(
+        fn read_u32(&self, offset: u32, gas: &GasCounter) -> Result<u32, DeterministicHostError> {
+            let mut data = [std::mem::MaybeUninit::<u8>::uninit(); 4];
+            let init = self.read(offset, &mut data, gas)?;
+            Ok(u32::from_le_bytes(init.try_into().unwrap()))
+        }
+
+        fn read<'a>(
             &self,
             offset: u32,
-            size: u32,
+            buffer: &'a mut [std::mem::MaybeUninit<u8>],
             _gas: &GasCounter,
-        ) -> Result<Vec<u8>, DeterministicHostError> {
+        ) -> Result<&'a mut [u8], DeterministicHostError> {
             let memory_byte_count = self.memory.len();
             if memory_byte_count == 0 {
                 return Err(DeterministicHostError::from(anyhow!(
@@ -462,7 +463,7 @@ mod tests {
             }
 
             let start_offset = offset as usize;
-            let end_offset_exclusive = start_offset + size as usize;
+            let end_offset_exclusive = start_offset + buffer.len();
 
             if start_offset >= memory_byte_count {
                 return Err(DeterministicHostError::from(anyhow!(
@@ -480,7 +481,9 @@ mod tests {
                 )));
             }
 
-            return Ok(Vec::from(&self.memory[start_offset..end_offset_exclusive]));
+            let src = &self.memory[start_offset..end_offset_exclusive];
+
+            Ok(init_slice(src, buffer))
         }
 
         fn api_version(&self) -> graph::semver::Version {

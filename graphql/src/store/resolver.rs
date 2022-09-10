@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::result;
 use std::sync::Arc;
 
+use graph::data::query::Trace;
 use graph::data::value::Object;
 use graph::data::{
     graphql::{object, ObjectOrInterface},
@@ -11,8 +12,8 @@ use graph::prelude::*;
 use graph::{components::store::*, data::schema::BLOCK_FIELD_TYPE};
 
 use crate::execution::ast as a;
+use crate::metrics::GraphQLMetrics;
 use crate::query::ext::BlockConstraint;
-use crate::runner::ResultSizeMetrics;
 use crate::schema::ast as sast;
 use crate::{prelude::*, schema::api::ErrorPolicy};
 
@@ -25,11 +26,32 @@ pub struct StoreResolver {
     logger: Logger,
     pub(crate) store: Arc<dyn QueryStore>,
     subscription_manager: Arc<dyn SubscriptionManager>,
-    pub(crate) block_ptr: Option<BlockPtr>,
+    pub(crate) block_ptr: Option<BlockPtrTs>,
     deployment: DeploymentHash,
     has_non_fatal_errors: bool,
     error_policy: ErrorPolicy,
-    result_size: Arc<ResultSizeMetrics>,
+    graphql_metrics: Arc<GraphQLMetrics>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BlockPtrTs {
+    pub ptr: BlockPtr,
+    pub timestamp: Option<u64>,
+}
+
+impl From<BlockPtr> for BlockPtrTs {
+    fn from(ptr: BlockPtr) -> Self {
+        Self {
+            ptr,
+            timestamp: None,
+        }
+    }
+}
+
+impl From<&BlockPtrTs> for BlockPtr {
+    fn from(ptr: &BlockPtrTs) -> Self {
+        ptr.ptr.cheap_clone()
+    }
 }
 
 impl CheapClone for StoreResolver {}
@@ -44,7 +66,7 @@ impl StoreResolver {
         deployment: DeploymentHash,
         store: Arc<dyn QueryStore>,
         subscription_manager: Arc<dyn SubscriptionManager>,
-        result_size: Arc<ResultSizeMetrics>,
+        graphql_metrics: Arc<GraphQLMetrics>,
     ) -> Self {
         StoreResolver {
             logger: logger.new(o!("component" => "StoreResolver")),
@@ -56,7 +78,7 @@ impl StoreResolver {
             // Checking for non-fatal errors does not work with subscriptions.
             has_non_fatal_errors: false,
             error_policy: ErrorPolicy::Deny,
-            result_size,
+            graphql_metrics,
         }
     }
 
@@ -68,18 +90,18 @@ impl StoreResolver {
     pub async fn at_block(
         logger: &Logger,
         store: Arc<dyn QueryStore>,
+        state: &DeploymentState,
         subscription_manager: Arc<dyn SubscriptionManager>,
         bc: BlockConstraint,
         error_policy: ErrorPolicy,
         deployment: DeploymentHash,
-        result_size: Arc<ResultSizeMetrics>,
+        graphql_metrics: Arc<GraphQLMetrics>,
     ) -> Result<Self, QueryExecutionError> {
         let store_clone = store.cheap_clone();
-        let deployment2 = deployment.clone();
-        let block_ptr = Self::locate_block(store_clone.as_ref(), bc, deployment2.clone()).await?;
+        let block_ptr = Self::locate_block(store_clone.as_ref(), bc, state).await?;
 
         let has_non_fatal_errors = store
-            .has_non_fatal_errors(Some(block_ptr.block_number()))
+            .has_deterministic_errors(block_ptr.ptr.block_number())
             .await?;
 
         let resolver = StoreResolver {
@@ -90,7 +112,7 @@ impl StoreResolver {
             deployment,
             has_non_fatal_errors,
             error_policy,
-            result_size,
+            graphql_metrics,
         };
         Ok(resolver)
     }
@@ -98,76 +120,96 @@ impl StoreResolver {
     pub fn block_number(&self) -> BlockNumber {
         self.block_ptr
             .as_ref()
-            .map(|ptr| ptr.number as BlockNumber)
+            .map(|ptr| ptr.ptr.number as BlockNumber)
             .unwrap_or(BLOCK_NUMBER_MAX)
     }
 
+    /// locate_block returns the block pointer and it's timestamp when available.
     async fn locate_block(
         store: &dyn QueryStore,
         bc: BlockConstraint,
-        subgraph: DeploymentHash,
-    ) -> Result<BlockPtr, QueryExecutionError> {
-        fn check_ptr(
-            subgraph: DeploymentHash,
-            ptr: BlockPtr,
-            min: BlockNumber,
-        ) -> Result<BlockPtr, QueryExecutionError> {
-            if ptr.number < min {
-                return Err(QueryExecutionError::ValueParseError(
-                    "block.number".to_owned(),
-                    format!(
-                        "subgraph {} has only indexed up to block number {} \
-                            and data for block number {} is therefore not yet available",
-                        subgraph, ptr.number, min
-                    ),
-                ));
-            }
-            Ok(ptr)
+        state: &DeploymentState,
+    ) -> Result<BlockPtrTs, QueryExecutionError> {
+        fn block_queryable(
+            state: &DeploymentState,
+            block: BlockNumber,
+        ) -> Result<(), QueryExecutionError> {
+            state
+                .block_queryable(block)
+                .map_err(|msg| QueryExecutionError::ValueParseError("block.number".to_owned(), msg))
         }
 
-        let subgraph_block_ptr = store
-            .block_ptr()
-            .await
-            .map_err(Into::into)
-            .map(|ptr| ptr.expect("we should have already checked that the subgraph exists"));
+        async fn get_block_ts(
+            store: &dyn QueryStore,
+            ptr: &BlockPtr,
+        ) -> Result<Option<u64>, QueryExecutionError> {
+            match store
+                .block_number_with_timestamp(&ptr.hash)
+                .await
+                .map_err(Into::<QueryExecutionError>::into)?
+            {
+                Some((_, Some(ts))) => Ok(Some(ts)),
+                _ => Ok(None),
+            }
+        }
 
         match bc {
             BlockConstraint::Hash(hash) => {
                 let ptr = store
-                    .block_number(&hash)
+                    .block_number_with_timestamp(&hash)
+                    .await
                     .map_err(Into::into)
-                    .and_then(|number| {
-                        number
+                    .and_then(|result| {
+                        result
                             .ok_or_else(|| {
                                 QueryExecutionError::ValueParseError(
                                     "block.hash".to_owned(),
                                     "no block with that hash found".to_owned(),
                                 )
                             })
-                            .map(|number| BlockPtr::new(hash, number))
+                            .map(|(number, ts)| BlockPtrTs {
+                                ptr: BlockPtr::new(hash, number),
+                                timestamp: ts,
+                            })
                     })?;
 
-                subgraph_block_ptr.and_then(|subgraph_ptr| {
-                    check_ptr(subgraph, subgraph_ptr, ptr.number)?;
-                    Ok(ptr)
-                })
+                block_queryable(state, ptr.ptr.number)?;
+                Ok(ptr)
             }
             BlockConstraint::Number(number) => {
-                subgraph_block_ptr.and_then(|ptr| {
-                    check_ptr(subgraph, ptr, number)?;
-                    // We don't have a way here to look the block hash up from
-                    // the database, and even if we did, there is no guarantee
-                    // that we have the block in our cache. We therefore
-                    // always return an all zeroes hash when users specify
-                    // a block number
-                    // See 7a7b9708-adb7-4fc2-acec-88680cb07ec1
-                    Ok(BlockPtr::from((web3::types::H256::zero(), number as u64)))
+                block_queryable(state, number)?;
+                // We don't have a way here to look the block hash up from
+                // the database, and even if we did, there is no guarantee
+                // that we have the block in our cache. We therefore
+                // always return an all zeroes hash when users specify
+                // a block number
+                // See 7a7b9708-adb7-4fc2-acec-88680cb07ec1
+                Ok(BlockPtr::from((web3::types::H256::zero(), number as u64)).into())
+            }
+            BlockConstraint::Min(min) => {
+                let ptr = state.latest_block.cheap_clone();
+                if ptr.number < min {
+                    return Err(QueryExecutionError::ValueParseError(
+                        "block.number_gte".to_owned(),
+                        format!(
+                            "subgraph {} has only indexed up to block number {} \
+                                and data for block number {} is therefore not yet available",
+                            state.id, ptr.number, min
+                        ),
+                    ));
+                }
+                let timestamp = get_block_ts(store, &state.latest_block).await?;
+
+                Ok(BlockPtrTs { ptr, timestamp })
+            }
+            BlockConstraint::Latest => {
+                let timestamp = get_block_ts(store, &state.latest_block).await?;
+
+                Ok(BlockPtrTs {
+                    ptr: state.latest_block.cheap_clone(),
+                    timestamp,
                 })
             }
-            BlockConstraint::Min(number) => {
-                subgraph_block_ptr.and_then(|ptr| check_ptr(subgraph, ptr, number))
-            }
-            BlockConstraint::Latest => subgraph_block_ptr,
         }
     }
 
@@ -188,7 +230,7 @@ impl StoreResolver {
                     // locate_block indicates that we do not have a block hash
                     // by setting the hash to `zero`
                     // See 7a7b9708-adb7-4fc2-acec-88680cb07ec1
-                    let hash_h256 = ptr.hash_as_h256();
+                    let hash_h256 = ptr.ptr.hash_as_h256();
                     if hash_h256 == web3::types::H256::zero() {
                         None
                     } else {
@@ -199,12 +241,21 @@ impl StoreResolver {
             let number = self
                 .block_ptr
                 .as_ref()
-                .map(|ptr| r::Value::Int((ptr.number as i32).into()))
+                .map(|ptr| r::Value::Int((ptr.ptr.number as i32).into()))
                 .unwrap_or(r::Value::Null);
+
+            let timestamp = self.block_ptr.as_ref().map(|ptr| {
+                ptr.timestamp
+                    .clone()
+                    .map(|ts| r::Value::Int(ts as i64))
+                    .unwrap_or(r::Value::Null)
+            });
+
             let mut map = BTreeMap::new();
             let block = object! {
                 hash: hash,
                 number: number,
+                timestamp: timestamp,
                 __typename: BLOCK_FIELD_TYPE
             };
             map.insert("prefetch:block".into(), r::Value::List(vec![block]));
@@ -238,11 +289,12 @@ impl Resolver for StoreResolver {
         &self,
         ctx: &ExecutionContext<Self>,
         selection_set: &a::SelectionSet,
-    ) -> Result<Option<r::Value>, Vec<QueryExecutionError>> {
-        super::prefetch::run(self, ctx, selection_set, &self.result_size).map(Some)
+    ) -> Result<(Option<r::Value>, Trace), Vec<QueryExecutionError>> {
+        super::prefetch::run(self, ctx, selection_set, &self.graphql_metrics)
+            .map(|(value, trace)| (Some(value), trace))
     }
 
-    fn resolve_objects(
+    async fn resolve_objects(
         &self,
         prefetched_objects: Option<r::Value>,
         field: &a::Field,
