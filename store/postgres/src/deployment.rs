@@ -1,7 +1,7 @@
 //! Utilities for dealing with deployment metadata. Any connection passed
 //! into these methods must be for the shard that holds the actual
 //! deployment data and metadata
-use crate::{detail::GraphNodeVersion, primary::DeploymentId};
+use crate::{advisory_lock, detail::GraphNodeVersion, primary::DeploymentId};
 use diesel::{
     connection::SimpleConnection,
     dsl::{count, delete, insert_into, select, sql, update},
@@ -113,6 +113,7 @@ table! {
         /// Parent of the smallest start block from the manifest
         start_block_number -> Nullable<Integer>,
         start_block_hash -> Nullable<Binary>,
+        raw_yaml -> Nullable<Text>,
     }
 }
 
@@ -273,6 +274,22 @@ pub fn features(conn: &PgConnection, site: &Site) -> Result<BTreeSet<SubgraphFea
         .iter()
         .map(|f| SubgraphFeature::from_str(f).map_err(StoreError::from))
         .collect()
+}
+
+/// This migrates subgraphs that existed before the raw_yaml column was added.
+pub fn set_manifest_raw_yaml(
+    conn: &PgConnection,
+    site: &Site,
+    raw_yaml: &str,
+) -> Result<(), StoreError> {
+    use subgraph_manifest as sm;
+
+    update(sm::table.filter(sm::id.eq(site.id)))
+        .filter(sm::raw_yaml.is_null())
+        .set(sm::raw_yaml.eq(raw_yaml))
+        .execute(conn)
+        .map(|_| ())
+        .map_err(|e| e.into())
 }
 
 pub fn transact_block(
@@ -453,11 +470,15 @@ pub fn initialize_block_ptr(conn: &PgConnection, site: &Site) -> Result<(), Stor
 
     let needs_init = d::table
         .filter(d::id.eq(site.id))
-        .filter(d::latest_ethereum_block_hash.is_null())
-        .select(d::id)
-        .first::<i32>(conn)
-        .optional()?
-        .is_some();
+        .select(d::latest_ethereum_block_hash)
+        .first::<Option<Vec<u8>>>(conn)
+        .map_err(|e| {
+            constraint_violation!(
+                "deployment sgd{} must have been created before calling initialize_block_ptr but we got {}",
+                site.id, e
+            )
+        })?
+        .is_none();
 
     if needs_init {
         if let (Some(hash), Some(number)) = m::table
@@ -889,6 +910,7 @@ pub fn create_deployment(
                 repository,
                 features,
                 schema,
+                raw_yaml,
             },
         earliest_block,
         graft_base,
@@ -932,6 +954,7 @@ pub fn create_deployment(
         m::use_bytea_prefix.eq(true),
         m::start_block_hash.eq(b(&earliest_block)),
         m::start_block_number.eq(earliest_block_number),
+        m::raw_yaml.eq(raw_yaml),
     );
 
     if exists && replace {
@@ -1009,4 +1032,26 @@ pub fn set_entity_count(
         .set(d::entity_count.eq(sql(&full_count_query)))
         .execute(conn)?;
     Ok(())
+}
+
+pub fn set_earliest_block(
+    conn: &PgConnection,
+    site: &Site,
+    earliest_block: BlockNumber,
+) -> Result<(), StoreError> {
+    use subgraph_deployment as d;
+
+    update(d::table.filter(d::id.eq(site.id)))
+        .set(d::earliest_block_number.eq(earliest_block))
+        .execute(conn)?;
+    Ok(())
+}
+
+/// Lock the deployment `site` for writes for the remainder of the current
+/// transaction. This lock is used to coordinate the changes that the
+/// subgraph writer makes with changes that other parts of the system, in
+/// particular, pruning make
+//  see also: deployment-lock-for-update
+pub fn lock(conn: &PgConnection, site: &Site) -> Result<(), StoreError> {
+    advisory_lock::lock_deployment_xact(conn, site)
 }

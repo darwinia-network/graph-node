@@ -5,7 +5,6 @@ use graph::cheap_clone::CheapClone;
 use graph::data::subgraph::UnifiedMappingApiVersion;
 use graph::prelude::MetricsRegistry;
 use graph::{
-    anyhow::anyhow,
     blockchain::{
         block_stream::{
             BlockStream, BlockStreamEvent, BlockWithTriggers, FirehoseError,
@@ -106,19 +105,14 @@ impl Blockchain for Chain {
             .triggers_adapter(&deployment, &NodeCapabilities {}, unified_api_version)
             .unwrap_or_else(|_| panic!("no adapter for network {}", self.name));
 
-        let firehose_endpoint = match self.firehose_endpoints.random() {
-            Some(e) => e.clone(),
-            None => return Err(anyhow!("no firehose endpoint available",)),
-        };
+        let firehose_endpoint = self.firehose_endpoints.random()?;
 
         let logger = self
             .logger_factory
             .subgraph_logger(&deployment)
             .new(o!("component" => "FirehoseBlockStream"));
 
-        let firehose_mapper = Arc::new(FirehoseMapper {
-            endpoint: firehose_endpoint.cheap_clone(),
-        });
+        let firehose_mapper = Arc::new(FirehoseMapper {});
 
         Ok(Box::new(FirehoseBlockStream::new(
             deployment.hash,
@@ -154,10 +148,7 @@ impl Blockchain for Chain {
         logger: &Logger,
         number: BlockNumber,
     ) -> Result<BlockPtr, IngestorError> {
-        let firehose_endpoint = match self.firehose_endpoints.random() {
-            Some(e) => e.clone(),
-            None => return Err(anyhow!("no firehose endpoint available").into()),
-        };
+        let firehose_endpoint = self.firehose_endpoints.random()?;
 
         firehose_endpoint
             .block_ptr_for_number::<codec::HeaderOnlyBlock>(logger, number)
@@ -178,6 +169,14 @@ pub struct TriggersAdapter {}
 
 #[async_trait]
 impl TriggersAdapterTrait<Chain> for TriggersAdapter {
+    async fn ancestor_block(
+        &self,
+        _ptr: BlockPtr,
+        _offset: BlockNumber,
+    ) -> Result<Option<codec::Block>, Error> {
+        panic!("Should never be called since not used by FirehoseBlockStream")
+    }
+
     async fn scan_triggers(
         &self,
         _from: BlockNumber,
@@ -204,10 +203,30 @@ impl TriggersAdapterTrait<Chain> for TriggersAdapter {
             // block. This is not currently possible because EventData is automatically
             // generated.
             .filter_map(|event| {
-                filter_event_trigger(filter, event, &header_only_block, EventOrigin::BeginBlock)
+                filter_event_trigger(
+                    filter,
+                    event,
+                    &header_only_block,
+                    None,
+                    EventOrigin::BeginBlock,
+                )
             })
-            .chain(shared_block.tx_events()?.cloned().filter_map(|event| {
-                filter_event_trigger(filter, event, &header_only_block, EventOrigin::DeliverTx)
+            .chain(shared_block.transactions().flat_map(|tx| {
+                tx.result
+                    .as_ref()
+                    .unwrap()
+                    .events
+                    .iter()
+                    .filter_map(|e| {
+                        filter_event_trigger(
+                            filter,
+                            e.clone(),
+                            &header_only_block,
+                            Some(build_tx_context(tx)),
+                            EventOrigin::DeliverTx,
+                        )
+                    })
+                    .collect::<Vec<_>>()
             }))
             .chain(
                 shared_block
@@ -218,18 +237,32 @@ impl TriggersAdapterTrait<Chain> for TriggersAdapter {
                             filter,
                             event,
                             &header_only_block,
+                            None,
                             EventOrigin::EndBlock,
                         )
                     }),
             )
             .collect();
 
-        triggers.extend(
-            shared_block
-                .transactions()
-                .cloned()
-                .map(|tx| CosmosTrigger::with_transaction(tx, header_only_block.clone())),
-        );
+        triggers.extend(shared_block.transactions().cloned().flat_map(|tx_result| {
+            let mut triggers: Vec<_> = Vec::new();
+            if let Some(tx) = tx_result.tx.clone() {
+                if let Some(tx_body) = tx.body {
+                    triggers.extend(tx_body.messages.into_iter().map(|message| {
+                        CosmosTrigger::with_message(
+                            message,
+                            header_only_block.clone(),
+                            build_tx_context(&tx_result),
+                        )
+                    }));
+                }
+            }
+            triggers.push(CosmosTrigger::with_transaction(
+                tx_result,
+                header_only_block.clone(),
+            ));
+            triggers
+        }));
 
         if filter.block_filter.trigger_every_block {
             triggers.push(CosmosTrigger::Block(shared_block.cheap_clone()));
@@ -239,14 +272,6 @@ impl TriggersAdapterTrait<Chain> for TriggersAdapter {
     }
 
     async fn is_on_main_chain(&self, _ptr: BlockPtr) -> Result<bool, Error> {
-        panic!("Should never be called since not used by FirehoseBlockStream")
-    }
-
-    async fn ancestor_block(
-        &self,
-        _ptr: BlockPtr,
-        _offset: BlockNumber,
-    ) -> Result<Option<codec::Block>, Error> {
         panic!("Should never be called since not used by FirehoseBlockStream")
     }
 
@@ -265,18 +290,32 @@ fn filter_event_trigger(
     filter: &TriggerFilter,
     event: codec::Event,
     block: &codec::HeaderOnlyBlock,
+    tx_context: Option<codec::TransactionContext>,
     origin: EventOrigin,
 ) -> Option<CosmosTrigger> {
     if filter.event_type_filter.matches(&event.event_type) {
-        Some(CosmosTrigger::with_event(event, block.clone(), origin))
+        Some(CosmosTrigger::with_event(
+            event,
+            block.clone(),
+            tx_context,
+            origin,
+        ))
     } else {
         None
     }
 }
 
-pub struct FirehoseMapper {
-    endpoint: Arc<FirehoseEndpoint>,
+fn build_tx_context(tx: &codec::TxResult) -> codec::TransactionContext {
+    codec::TransactionContext {
+        hash: tx.hash.clone(),
+        index: tx.index,
+        code: tx.result.as_ref().unwrap().code,
+        gas_wanted: tx.result.as_ref().unwrap().gas_wanted,
+        gas_used: tx.result.as_ref().unwrap().gas_used,
+    }
 }
+
+pub struct FirehoseMapper {}
 
 #[async_trait]
 impl FirehoseMapperTrait<Chain> for FirehoseMapper {
@@ -339,9 +378,10 @@ impl FirehoseMapperTrait<Chain> for FirehoseMapper {
     async fn block_ptr_for_number(
         &self,
         logger: &Logger,
+        endpoint: &Arc<FirehoseEndpoint>,
         number: BlockNumber,
     ) -> Result<BlockPtr, Error> {
-        self.endpoint
+        endpoint
             .block_ptr_for_number::<codec::HeaderOnlyBlock>(logger, number)
             .await
     }
@@ -349,11 +389,11 @@ impl FirehoseMapperTrait<Chain> for FirehoseMapper {
     async fn final_block_ptr_for(
         &self,
         logger: &Logger,
+        endpoint: &Arc<FirehoseEndpoint>,
         block: &codec::Block,
     ) -> Result<BlockPtr, Error> {
         // Cosmos provides instant block finality.
-        self.endpoint
-            .block_ptr_for_number::<codec::HeaderOnlyBlock>(logger, block.number())
+        self.block_ptr_for_number(logger, endpoint, block.number())
             .await
     }
 }
@@ -408,16 +448,19 @@ mod test {
                     CosmosTrigger::with_event(
                         Event::test_with_type("begin_event_3"),
                         header_only_block.clone(),
+                        None,
                         EventOrigin::BeginBlock,
                     ),
                     CosmosTrigger::with_event(
                         Event::test_with_type("tx_event_3"),
                         header_only_block.clone(),
+                        Some(build_tx_context(&block_with_events.transactions[2])),
                         EventOrigin::DeliverTx,
                     ),
                     CosmosTrigger::with_event(
                         Event::test_with_type("end_event_3"),
                         header_only_block.clone(),
+                        None,
                         EventOrigin::EndBlock,
                     ),
                     CosmosTrigger::with_transaction(
@@ -442,16 +485,19 @@ mod test {
                     CosmosTrigger::with_event(
                         Event::test_with_type("begin_event_3"),
                         header_only_block.clone(),
+                        None,
                         EventOrigin::BeginBlock,
                     ),
                     CosmosTrigger::with_event(
                         Event::test_with_type("tx_event_2"),
                         header_only_block.clone(),
+                        Some(build_tx_context(&block_with_events.transactions[1])),
                         EventOrigin::DeliverTx,
                     ),
                     CosmosTrigger::with_event(
                         Event::test_with_type("end_event_1"),
                         header_only_block.clone(),
+                        None,
                         EventOrigin::EndBlock,
                     ),
                     CosmosTrigger::with_transaction(

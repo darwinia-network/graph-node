@@ -17,7 +17,7 @@ use graph::{
         server::index_node::VersionInfo,
         store::{
             self, BlockStore, DeploymentLocator, DeploymentSchemaVersion,
-            EnsLookup as EnsLookupTrait, SubgraphFork,
+            EnsLookup as EnsLookupTrait, PruneReporter, SubgraphFork,
         },
     },
     constraint_violation,
@@ -27,8 +27,9 @@ use graph::{
     prelude::{
         anyhow, futures03::future::join_all, lazy_static, o, web3::types::Address, ApiSchema,
         ApiVersion, BlockHash, BlockNumber, BlockPtr, ChainStore, DeploymentHash, EntityOperation,
-        Logger, MetricsRegistry, NodeId, PartialBlockPtr, Schema, StoreError, SubgraphName,
-        SubgraphStore as SubgraphStoreTrait, SubgraphVersionSwitchingMode,
+        Logger, MetricsRegistry, NodeId, PartialBlockPtr, Schema, StoreError,
+        SubgraphDeploymentEntity, SubgraphName, SubgraphStore as SubgraphStoreTrait,
+        SubgraphVersionSwitchingMode,
     },
     url::Url,
     util::timed_cache::TimedCache,
@@ -228,7 +229,7 @@ impl SubgraphStore {
         }
     }
 
-    pub(crate) async fn get_proof_of_indexing(
+    pub async fn get_proof_of_indexing(
         &self,
         id: &DeploymentHash,
         indexer: &Option<Address>,
@@ -372,6 +373,20 @@ impl SubgraphStoreInner {
         Ok(site)
     }
 
+    fn evict(&self, id: &DeploymentHash) -> Result<(), StoreError> {
+        if let Some((site, _)) = self.sites.remove(id) {
+            let store = self.stores.get(&site.shard).ok_or_else(|| {
+                constraint_violation!(
+                    "shard {} for deployment sgd{} not found when evicting",
+                    site.shard,
+                    site.id
+                )
+            })?;
+            store.layout_cache.remove(&site);
+        }
+        Ok(())
+    }
+
     fn find_site(&self, id: DeploymentId) -> Result<Arc<Site>, StoreError> {
         if let Some(site) = self.sites.find(|site| site.id == id) {
             return Ok(site);
@@ -497,6 +512,8 @@ impl SubgraphStoreInner {
     ) -> Result<DeploymentLocator, StoreError> {
         #[cfg(not(debug_assertions))]
         assert!(!replace);
+
+        self.evict(&schema.id)?;
 
         let graft_base = deployment
             .graft_base
@@ -1044,6 +1061,59 @@ impl SubgraphStoreInner {
         let (store, site) = self.store(&deployment.hash)?;
         store.drop_index(site, index_name).await
     }
+
+    pub async fn set_account_like(
+        &self,
+        deployment: &DeploymentLocator,
+        table: &str,
+        is_account_like: bool,
+    ) -> Result<(), StoreError> {
+        let (store, site) = self.store(&deployment.hash)?;
+        store.set_account_like(site, table, is_account_like).await
+    }
+
+    /// Remove the history that is only needed to respond to queries before
+    /// block number `earliest_block` from the given deployment
+    ///
+    /// Only tables with a ratio of entities to entity versions below
+    /// `prune_ratio` will be pruned; that ratio is determined by looking at
+    /// Postgres planner stats to avoid lengthy counting queries. It is
+    /// assumed that if the ratio is higher than `prune_ratio` that pruning
+    /// won't make much of a difference and will just cause unnecessary
+    /// work.
+    ///
+    /// The `reorg_threshold` is used to determine which blocks will not be
+    /// modified any more by the subgraph writer that may be running
+    /// concurrently to reduce the amount of time that the writer needs to
+    /// be locked out while pruning is happening.
+    ///
+    /// Pruning can take a long time, and is structured into multiple
+    /// transactions such that none of them takes an excessively long time.
+    /// If pruning gets interrupted, it may leave some intermediate tables
+    /// in the database behind. Those will get cleaned up the next time an
+    /// attempt is made to prune the same deployment.
+    pub async fn prune(
+        &self,
+        reporter: Box<dyn PruneReporter>,
+        deployment: &DeploymentLocator,
+        earliest_block: BlockNumber,
+        reorg_threshold: BlockNumber,
+        prune_ratio: f64,
+    ) -> Result<Box<dyn PruneReporter>, StoreError> {
+        // Find the store by the deployment id; otherwise, we could only
+        // prune the active copy of the deployment with `deployment.hash`
+        let site = self.find_site(deployment.id.into())?;
+        let store = self.for_site(&site)?;
+
+        store
+            .prune(reporter, site, earliest_block, reorg_threshold, prune_ratio)
+            .await
+    }
+
+    pub fn load_deployment(&self, site: &Site) -> Result<SubgraphDeploymentEntity, StoreError> {
+        let src_store = self.for_site(site)?;
+        src_store.load_deployment(site)
+    }
 }
 
 struct EnsLookup {
@@ -1184,7 +1254,12 @@ impl SubgraphStoreTrait for SubgraphStore {
         // idempotent and there is ever only one `WritableStore` for any
         // deployment
         if let Some(writable) = self.writables.lock().unwrap().get(&deployment) {
-            return Ok(writable.cheap_clone());
+            // A poisoned writable will not write anything anymore; we
+            // discard it and create a new one that is properly initialized
+            // according to the state in the database.
+            if !writable.poisoned() {
+                return Ok(writable.cheap_clone());
+            }
         }
 
         // Ideally the lower level functions would be asyncified.
@@ -1203,6 +1278,18 @@ impl SubgraphStoreTrait for SubgraphStore {
             .unwrap()
             .insert(deployment, writable.cheap_clone());
         Ok(writable)
+    }
+
+    async fn stop_subgraph(&self, loc: &DeploymentLocator) -> Result<(), StoreError> {
+        self.evict(&loc.hash)?;
+
+        // Remove the writable from the cache and stop it
+        let deployment = loc.id.into();
+        let writable = self.writables.lock().unwrap().remove(&deployment);
+        match writable {
+            Some(writable) => writable.stop().await,
+            None => Ok(()),
+        }
     }
 
     fn is_deployed(&self, id: &DeploymentHash) -> Result<bool, StoreError> {
@@ -1232,5 +1319,14 @@ impl SubgraphStoreTrait for SubgraphStore {
             .iter()
             .map(|site| site.into())
             .collect())
+    }
+
+    async fn set_manifest_raw_yaml(
+        &self,
+        hash: &DeploymentHash,
+        raw_yaml: String,
+    ) -> Result<(), StoreError> {
+        let (store, site) = self.store(hash)?;
+        store.set_manifest_raw_yaml(site, raw_yaml).await
     }
 }

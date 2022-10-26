@@ -1,3 +1,4 @@
+use clap::{Parser, Subcommand};
 use config::PoolSize;
 use git_testament::{git_testament, render_testament};
 use graph::{data::graphql::effort::LoadManager, prelude::chrono, prometheus::Registry};
@@ -15,11 +16,12 @@ use graph_graphql::prelude::GraphQlRunner;
 use graph_node::config::{self, Config as Cfg};
 use graph_node::manager::commands;
 use graph_node::{
-    chain::create_ethereum_networks,
+    chain::create_all_ethereum_networks,
     manager::{deployment::DeploymentSearch, PanicSubscriptionManager},
     store_builder::StoreBuilder,
     MetricsContext,
 };
+use graph_store_postgres::connection_pool::PoolCoordinator;
 use graph_store_postgres::ChainStore;
 use graph_store_postgres::{
     connection_pool::ConnectionPool, BlockStore, NotificationSender, Shard, Store, SubgraphStore,
@@ -27,8 +29,6 @@ use graph_store_postgres::{
 };
 use lazy_static::lazy_static;
 use std::{collections::HashMap, env, num::ParseIntError, sync::Arc, time::Duration};
-use structopt::StructOpt;
-
 const VERSION_LABEL_KEY: &str = "version";
 
 git_testament!(TESTAMENT);
@@ -37,22 +37,22 @@ lazy_static! {
     static ref RENDERED_TESTAMENT: String = render_testament!(TESTAMENT);
 }
 
-#[derive(Clone, Debug, StructOpt)]
-#[structopt(
+#[derive(Parser, Clone, Debug)]
+#[clap(
     name = "graphman",
     about = "Management tool for a graph-node infrastructure",
     author = "Graph Protocol, Inc.",
     version = RENDERED_TESTAMENT.as_str()
 )]
 pub struct Opt {
-    #[structopt(
+    #[clap(
         long,
         short,
         env = "GRAPH_NODE_CONFIG",
         help = "the name of the configuration file\n"
     )]
     pub config: String,
-    #[structopt(
+    #[clap(
         long,
         default_value = "default",
         value_name = "NODE_ID",
@@ -60,7 +60,7 @@ pub struct Opt {
         help = "a unique identifier for this node.\nShould have the same value between consecutive node restarts\n"
     )]
     pub node_id: String,
-    #[structopt(
+    #[clap(
         long,
         value_name = "{HOST:PORT|URL}",
         default_value = "https://api.thegraph.com/ipfs/",
@@ -68,25 +68,25 @@ pub struct Opt {
         help = "HTTP addresses of IPFS nodes"
     )]
     pub ipfs: Vec<String>,
-    #[structopt(
+    #[clap(
         long,
         default_value = "3",
         help = "the size for connection pools. Set to 0\n to use pool size from configuration file\n corresponding to NODE_ID"
     )]
     pub pool_size: u32,
-    #[structopt(long, value_name = "URL", help = "Base URL for forking subgraphs")]
+    #[clap(long, value_name = "URL", help = "Base URL for forking subgraphs")]
     pub fork_base: Option<String>,
-    #[structopt(long, help = "version label, used for prometheus metrics")]
+    #[clap(long, help = "version label, used for prometheus metrics")]
     pub version_label: Option<String>,
-    #[structopt(subcommand)]
+    #[clap(subcommand)]
     pub cmd: Command,
 }
 
-#[derive(Clone, Debug, StructOpt)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum Command {
     /// Calculate the transaction speed
     TxnSpeed {
-        #[structopt(long, short, default_value = "60")]
+        #[clap(long, short, default_value = "60")]
         delay: u64,
     },
     /// Print details about a deployment
@@ -99,22 +99,23 @@ pub enum Command {
         /// The deployment (see above)
         deployment: DeploymentSearch,
         /// List only current version
-        #[structopt(long, short)]
+        #[clap(long, short)]
         current: bool,
         /// List only pending versions
-        #[structopt(long, short)]
+        #[clap(long, short)]
         pending: bool,
         /// Include status information
-        #[structopt(long, short)]
+        #[clap(long, short)]
         status: bool,
         /// List only used (current and pending) versions
-        #[structopt(long, short)]
+        #[clap(long, short)]
         used: bool,
     },
     /// Manage unused deployments
     ///
     /// Record which deployments are unused with `record`, then remove them
     /// with `remove`
+    #[clap(subcommand)]
     Unused(UnusedCommand),
     /// Remove a named subgraph
     Remove {
@@ -142,10 +143,10 @@ pub enum Command {
     Rewind {
         /// Force rewinding even if the block hash is not found in the local
         /// database
-        #[structopt(long, short)]
+        #[clap(long, short)]
         force: bool,
         /// Sleep for this many seconds after pausing subgraphs
-        #[structopt(
+        #[clap(
             long,
             short,
             default_value = "10",
@@ -159,9 +160,14 @@ pub enum Command {
         /// The deployments to rewind (see `help info`)
         deployments: Vec<DeploymentSearch>,
     },
-    /// Deploy and run an arbitrary subgraph up to a certain block, although it can surpass it by a few blocks, it's not exact (use for dev and testing purposes) -- WARNING: WILL RUN MIGRATIONS ON THE DB, DO NOT USE IN PRODUCTION
+    /// Deploy and run an arbitrary subgraph up to a certain block
     ///
-    /// Also worth noting that the deployed subgraph will be removed at the end.
+    /// The run can surpass it by a few blocks, it's not exact (use for dev
+    /// and testing purposes) -- WARNING: WILL RUN MIGRATIONS ON THE DB, DO
+    /// NOT USE IN PRODUCTION
+    ///
+    /// Also worth noting that the deployed subgraph will be removed at the
+    /// end.
     Run {
         /// Network name (must fit one of the chain)
         network_name: String,
@@ -179,18 +185,21 @@ pub enum Command {
     ///
     /// Print information about a configuration file without
     /// actually connecting to databases or network clients
+    #[clap(subcommand)]
     Config(ConfigCommand),
     /// Listen for store events and print them
+    #[clap(subcommand)]
     Listen(ListenCommand),
     /// Manage deployment copies and grafts
+    #[clap(subcommand)]
     Copy(CopyCommand),
     /// Run a GraphQL query
     Query {
         /// Save the JSON query result in this file
-        #[structopt(long, short)]
+        #[clap(long, short)]
         output: Option<String>,
         /// Save the query trace in this file
-        #[structopt(long, short)]
+        #[clap(long, short)]
         trace: Option<String>,
 
         /// The subgraph to query
@@ -203,12 +212,54 @@ pub enum Command {
         vars: Vec<String>,
     },
     /// Get information about chains and manipulate them
+    #[clap(subcommand)]
     Chain(ChainCommand),
     /// Manipulate internal subgraph statistics
+    #[clap(subcommand)]
     Stats(StatsCommand),
 
     /// Manage database indexes
+    #[clap(subcommand)]
     Index(IndexCommand),
+
+    /// Prune deployments
+    Prune {
+        /// The deployment to prune (see `help info`)
+        deployment: DeploymentSearch,
+        /// Prune tables with a ratio of entities to entity versions lower than this
+        #[clap(long, short, default_value = "0.20")]
+        prune_ratio: f64,
+        /// How much history to keep in blocks
+        #[clap(long, short = 'y', default_value = "10000")]
+        history: usize,
+    },
+
+    /// General database management
+    #[clap(subcommand)]
+    Database(DatabaseCommand),
+
+    /// Delete a deployment and all it's indexed data
+    ///
+    /// The deployment can be specified as either a subgraph name, an IPFS
+    /// hash `Qm..`, or the database namespace `sgdNNN`. Since the same IPFS
+    /// hash can be deployed in multiple shards, it is possible to specify
+    /// the shard by adding `:shard` to the IPFS hash.
+    Drop {
+        /// The deployment identifier
+        deployment: DeploymentSearch,
+        /// Search only for current version
+        #[clap(long, short)]
+        current: bool,
+        /// Search only for pending versions
+        #[clap(long, short)]
+        pending: bool,
+        /// Search only for used (current and pending) versions
+        #[clap(long, short)]
+        used: bool,
+        /// Skip confirmation prompt
+        #[clap(long, short)]
+        force: bool,
+    },
 }
 
 impl Command {
@@ -220,12 +271,12 @@ impl Command {
     }
 }
 
-#[derive(Clone, Debug, StructOpt)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum UnusedCommand {
     /// List unused deployments
     List {
         /// Only list unused deployments that still exist
-        #[structopt(short, long)]
+        #[clap(short, long)]
         existing: bool,
     },
     /// Update and record currently unused deployments
@@ -236,23 +287,23 @@ pub enum UnusedCommand {
     /// i.e., smaller deployments are removed before larger ones
     Remove {
         /// How many unused deployments to remove (default: all)
-        #[structopt(short, long)]
+        #[clap(short, long)]
         count: Option<usize>,
         /// Remove a specific deployment
-        #[structopt(short, long, conflicts_with = "count")]
+        #[clap(short, long, conflicts_with = "count")]
         deployment: Option<String>,
         /// Remove unused deployments that were recorded at least this many minutes ago
-        #[structopt(short, long)]
+        #[clap(short, long)]
         older: Option<u32>,
     },
 }
 
-#[derive(Clone, Debug, StructOpt)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum ConfigCommand {
     /// Check and validate the configuration file
     Check {
         /// Print the configuration as JSON
-        #[structopt(long)]
+        #[clap(long)]
         print: bool,
     },
     /// Print how a specific subgraph would be placed
@@ -267,7 +318,7 @@ pub enum ConfigCommand {
         /// The names of the nodes that are going to run
         nodes: Vec<String>,
         /// Print connections by shard rather than by node
-        #[structopt(short, long)]
+        #[clap(short, long)]
         shard: bool,
     },
     /// Show eligible providers
@@ -276,13 +327,13 @@ pub enum ConfigCommand {
     /// network with the given features. Set the name of the node for which
     /// to simulate placement with the toplevel `--node-id` option
     Provider {
-        #[structopt(short, long, default_value = "")]
+        #[clap(short, long, default_value = "")]
         features: String,
         network: String,
     },
 }
 
-#[derive(Clone, Debug, StructOpt)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum ListenCommand {
     /// Listen only to assignment events
     Assignments,
@@ -294,7 +345,7 @@ pub enum ListenCommand {
         entity_types: Vec<String>,
     },
 }
-#[derive(Clone, Debug, StructOpt)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum CopyCommand {
     /// Create a copy of an existing subgraph
     ///
@@ -306,7 +357,7 @@ pub enum CopyCommand {
     /// should be chosen such that only final blocks are copied
     Create {
         /// How far behind `src` subgraph head to copy
-        #[structopt(long, short, default_value = "200")]
+        #[clap(long, short, default_value = "200")]
         offset: u32,
         /// The source deployment (see `help info`)
         src: DeploymentSearch,
@@ -335,13 +386,13 @@ pub enum CopyCommand {
     },
 }
 
-#[derive(Clone, Debug, StructOpt)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum ChainCommand {
     /// List all chains that are in the database
     List,
     /// Show information about a chain
     Info {
-        #[structopt(
+        #[clap(
             long,
             short,
             default_value = "50",
@@ -349,7 +400,7 @@ pub enum ChainCommand {
             help = "the reorg threshold to check\n"
         )]
         reorg_threshold: i32,
-        #[structopt(long, help = "display block hashes\n")]
+        #[clap(long, help = "display block hashes\n")]
         hashes: bool,
         name: String,
     },
@@ -361,25 +412,24 @@ pub enum ChainCommand {
 
     /// Compares cached blocks with fresh ones and clears the block cache when they differ.
     CheckBlocks {
-        #[structopt(subcommand)] // Note that we mark a field as a subcommand
+        #[clap(subcommand)] // Note that we mark a field as a subcommand
         method: CheckBlockMethod,
-
         /// Chain name (must be an existing chain, see 'chain list')
-        #[structopt(empty_values = false)]
+        #[clap(empty_values = false)]
         chain_name: String,
     },
     /// Truncates the whole block cache for the given chain.
     Truncate {
         /// Chain name (must be an existing chain, see 'chain list')
-        #[structopt(empty_values = false)]
+        #[clap(empty_values = false)]
         chain_name: String,
         /// Skips confirmation prompt
-        #[structopt(long, short)]
+        #[clap(long, short)]
         force: bool,
     },
 }
 
-#[derive(Clone, Debug, StructOpt)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum StatsCommand {
     /// Toggle whether a table is account-like
     ///
@@ -388,7 +438,7 @@ pub enum StatsCommand {
     /// to distinct entities. It can take up to 5 minutes for this to take
     /// effect.
     AccountLike {
-        #[structopt(long, short, help = "do not set but clear the account-like flag\n")]
+        #[clap(long, short, help = "do not set but clear the account-like flag\n")]
         clear: bool,
         /// The deployment (see `help info`).
         deployment: DeploymentSearch,
@@ -399,15 +449,10 @@ pub enum StatsCommand {
     ///
     /// Show how many distinct entities and how many versions the tables of
     /// each subgraph have. The data is based on the statistics that
-    /// Postgres keeps, and only refreshed when a table is analyzed. If a
-    /// table name is passed, perform a full count of entities and versions
-    /// in that table, which can be very slow, but is needed since the
-    /// statistics based data can be off by an order of magnitude.
+    /// Postgres keeps, and only refreshed when a table is analyzed.
     Show {
         /// The deployment (see `help info`).
         deployment: DeploymentSearch,
-        /// The name of a table to fully count
-        table: Option<String>,
     },
     /// Perform a SQL ANALYZE in a Entity table
     Analyze {
@@ -418,7 +463,7 @@ pub enum StatsCommand {
     },
 }
 
-#[derive(Clone, Debug, StructOpt)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum IndexCommand {
     /// Creates a new database index.
     ///
@@ -431,22 +476,22 @@ pub enum IndexCommand {
     /// This command may be time-consuming.
     Create {
         /// The deployment (see `help info`).
-        #[structopt(empty_values = false)]
+        #[clap(empty_values = false)]
         deployment: DeploymentSearch,
         /// The Entity name.
         ///
         /// Can be expressed either in upper camel case (as its GraphQL definition) or in snake case
         /// (as its SQL table name).
-        #[structopt(empty_values = false)]
+        #[clap(empty_values = false)]
         entity: String,
         /// The Field names.
         ///
         /// Each field can be expressed either in camel case (as its GraphQL definition) or in snake
         /// case (as its SQL colmun name).
-        #[structopt(min_values = 1, required = true)]
+        #[clap(min_values = 1, required = true)]
         fields: Vec<String>,
         /// The index method. Defaults to `btree`.
-        #[structopt(
+        #[clap(
             short, long, default_value = "btree",
             possible_values = &["btree", "hash", "gist", "spgist", "gin", "brin"]
         )]
@@ -455,41 +500,84 @@ pub enum IndexCommand {
     /// Lists existing indexes for a given Entity
     List {
         /// The deployment (see `help info`).
-        #[structopt(empty_values = false)]
+        #[clap(empty_values = false)]
         deployment: DeploymentSearch,
         /// The Entity name.
         ///
         /// Can be expressed either in upper camel case (as its GraphQL definition) or in snake case
         /// (as its SQL table name).
-        #[structopt(empty_values = false)]
+        #[clap(empty_values = false)]
         entity: String,
     },
 
     /// Drops an index for a given deployment, concurrently
     Drop {
         /// The deployment (see `help info`).
-        #[structopt(empty_values = false)]
+        #[clap(empty_values = false)]
         deployment: DeploymentSearch,
         /// The name of the index to be dropped
-        #[structopt(empty_values = false)]
+        #[clap(empty_values = false)]
         index_name: String,
     },
 }
 
-#[derive(Clone, Debug, StructOpt)]
+#[derive(Clone, Debug, Subcommand)]
+pub enum DatabaseCommand {
+    /// Apply any pending migrations to the database schema in all shards
+    Migrate,
+    /// Refresh the mapping of tables into different shards
+    ///
+    /// This command rebuilds the mappings of tables from one shard into all
+    /// other shards. It makes it possible to fix these mappings when a
+    /// database migration was interrupted before it could rebuild the
+    /// mappings
+    ///
+    /// Each shard imports certain tables from all other shards. To recreate
+    /// the mappings in a given shard, use `--dest SHARD`, to recreate the
+    /// mappings in other shards that depend on a shard, use `--source
+    /// SHARD`. Without `--dest` and `--source` options, recreate all
+    /// possible mappings. Recreating mappings needlessly is harmless, but
+    /// might take quite a bit of time with a lot of shards.
+    Remap {
+        /// Only refresh mappings from SOURCE
+        #[clap(long, short)]
+        source: Option<String>,
+        /// Only refresh mappings inside DEST
+        #[clap(long, short)]
+        dest: Option<String>,
+        /// Continue remapping even when one operation fails
+        #[clap(long, short)]
+        force: bool,
+    },
+}
+#[derive(Clone, Debug, Subcommand)]
 pub enum CheckBlockMethod {
-    /// The number of the target block
-    ByHash { hash: String },
-
     /// The hash of the target block
-    ByNumber { number: i32 },
+    ByHash {
+        /// The block hash to verify
+        hash: String,
+    },
+
+    /// The number of the target block
+    ByNumber {
+        /// The block number to verify
+        number: i32,
+        /// Delete duplicated blocks (by number) if found
+        #[clap(long, short, action)]
+        delete_duplicates: bool,
+    },
 
     /// A block number range, inclusive on both ends.
     ByRange {
-        #[structopt(long, short)]
+        /// The first block number to verify
+        #[clap(long, short)]
         from: Option<i32>,
-        #[structopt(long, short)]
+        /// The last block number to verify
+        #[clap(long, short)]
         to: Option<i32>,
+        /// Delete duplicated blocks (by number) if found
+        #[clap(long, short, action)]
+        delete_duplicates: bool,
     },
 }
 
@@ -569,13 +657,14 @@ impl Context {
 
     fn primary_pool(self) -> ConnectionPool {
         let primary = self.config.primary_store();
+        let coord = Arc::new(PoolCoordinator::new(Arc::new(vec![])));
         let pool = StoreBuilder::main_pool(
             &self.logger,
             &self.node_id,
             PRIMARY_SHARD.as_str(),
             primary,
             self.metrics_registry(),
-            Arc::new(vec![]),
+            coord,
         );
         pool.skip_setup();
         pool
@@ -624,7 +713,7 @@ impl Context {
     }
 
     fn store_and_pools(self) -> (Arc<Store>, HashMap<Shard, ConnectionPool>) {
-        let (subgraph_store, pools) = StoreBuilder::make_subgraph_store_and_pools(
+        let (subgraph_store, pools, _) = StoreBuilder::make_subgraph_store_and_pools(
             &self.logger,
             &self.node_id,
             &self.config,
@@ -681,7 +770,7 @@ impl Context {
     async fn ethereum_networks(&self) -> anyhow::Result<EthereumNetworks> {
         let logger = self.logger.clone();
         let registry = self.metrics_registry();
-        create_ethereum_networks(logger, registry, &self.config).await
+        create_all_ethereum_networks(logger, registry, &self.config).await
     }
 
     fn chain_store(self, chain_name: &str) -> anyhow::Result<Arc<ChainStore>> {
@@ -713,7 +802,7 @@ impl Context {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let opt = Opt::from_args();
+    let opt = Opt::parse();
 
     let version_label = opt.version_label.clone();
     // Set up logger
@@ -812,7 +901,7 @@ async fn main() -> anyhow::Result<()> {
                 } => {
                     let count = count.unwrap_or(1_000_000);
                     let older = older.map(|older| chrono::Duration::minutes(older as i64));
-                    commands::unused_deployments::remove(store, count, deployment, older)
+                    commands::unused_deployments::remove(store, count, deployment.as_deref(), older)
                 }
             }
         }
@@ -833,7 +922,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Remove { name } => commands::remove::run(ctx.subgraph_store(), name),
+        Remove { name } => commands::remove::run(ctx.subgraph_store(), &name),
         Create { name } => commands::create::run(ctx.subgraph_store(), name),
         Unassign { deployment } => {
             let sender = ctx.notification_sender();
@@ -964,11 +1053,33 @@ async fn main() -> anyhow::Result<()> {
                         ByHash { hash } => {
                             by_hash(&hash, chain_store, &ethereum_adapter, &logger).await
                         }
-                        ByNumber { number } => {
-                            by_number(number, chain_store, &ethereum_adapter, &logger).await
+                        ByNumber {
+                            number,
+                            delete_duplicates,
+                        } => {
+                            by_number(
+                                number,
+                                chain_store,
+                                &ethereum_adapter,
+                                &logger,
+                                delete_duplicates,
+                            )
+                            .await
                         }
-                        ByRange { from, to } => {
-                            by_range(chain_store, &ethereum_adapter, from, to, &logger).await
+                        ByRange {
+                            from,
+                            to,
+                            delete_duplicates,
+                        } => {
+                            by_range(
+                                chain_store,
+                                &ethereum_adapter,
+                                from,
+                                to,
+                                &logger,
+                                delete_duplicates,
+                            )
+                            .await
                         }
                     }
                 }
@@ -986,10 +1097,19 @@ async fn main() -> anyhow::Result<()> {
                     clear,
                     deployment,
                     table,
-                } => commands::stats::account_like(ctx.pools(), clear, &deployment, table),
-                Show { deployment, table } => {
-                    commands::stats::show(ctx.pools(), &deployment, table)
+                } => {
+                    let (store, primary_pool) = ctx.store_and_primary();
+                    let subgraph_store = store.subgraph_store();
+                    commands::stats::account_like(
+                        subgraph_store,
+                        primary_pool,
+                        clear,
+                        &deployment,
+                        table,
+                    )
+                    .await
                 }
+                Show { deployment } => commands::stats::show(ctx.pools(), &deployment),
                 Analyze { deployment, entity } => {
                     let (store, primary_pool) = ctx.store_and_primary();
                     let subgraph_store = store.subgraph_store();
@@ -1029,6 +1149,55 @@ async fn main() -> anyhow::Result<()> {
                         .await
                 }
             }
+        }
+        Database(cmd) => {
+            match cmd {
+                DatabaseCommand::Migrate => {
+                    /* creating the store builder runs migrations */
+                    let _store_builder = ctx.store_builder().await;
+                    println!("All database migrations have been applied");
+                    Ok(())
+                }
+                DatabaseCommand::Remap {
+                    source,
+                    dest,
+                    force,
+                } => {
+                    let store_builder = ctx.store_builder().await;
+                    commands::database::remap(&store_builder.coord, source, dest, force).await
+                }
+            }
+        }
+        Prune {
+            deployment,
+            history,
+            prune_ratio,
+        } => {
+            let (store, primary_pool) = ctx.store_and_primary();
+            commands::prune::run(store, primary_pool, deployment, history, prune_ratio).await
+        }
+        Drop {
+            deployment,
+            current,
+            pending,
+            used,
+            force,
+        } => {
+            let sender = ctx.notification_sender();
+            let (store, primary_pool) = ctx.store_and_primary();
+            let subgraph_store = store.subgraph_store();
+
+            commands::drop::run(
+                primary_pool,
+                subgraph_store,
+                sender,
+                deployment,
+                current,
+                pending,
+                used,
+                force,
+            )
+            .await
         }
     }
 }

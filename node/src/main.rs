@@ -1,3 +1,4 @@
+use clap::Parser as _;
 use ethereum::chain::{EthereumAdapterSelector, EthereumStreamBuilder};
 use ethereum::{
     BlockIngestor as EthereumBlockIngestor, EthereumAdapterTrait, EthereumNetworks, RuntimeAdapter,
@@ -10,7 +11,7 @@ use graph::data::graphql::effort::LoadManager;
 use graph::env::EnvVars;
 use graph::firehose::{FirehoseEndpoints, FirehoseNetworks};
 use graph::log::logger;
-use graph::prelude::{IndexNodeServer as _, JsonRpcServer as _, *};
+use graph::prelude::{IndexNodeServer as _, *};
 use graph::prometheus::Registry;
 use graph::url::Url;
 use graph_chain_arweave::{self as arweave, Block as ArweaveBlock};
@@ -25,7 +26,7 @@ use graph_core::{
 };
 use graph_graphql::prelude::GraphQlRunner;
 use graph_node::chain::{
-    connect_ethereum_networks, connect_firehose_networks, create_ethereum_networks,
+    connect_ethereum_networks, connect_firehose_networks, create_all_ethereum_networks,
     create_firehose_networks, create_ipfs_clients, create_substreams_networks,
 };
 use graph_node::config::Config;
@@ -44,7 +45,6 @@ use std::path::Path;
 use std::sync::atomic;
 use std::time::Duration;
 use std::{collections::HashMap, env};
-use structopt::StructOpt;
 use tokio::sync::mpsc;
 
 git_testament!(TESTAMENT);
@@ -93,7 +93,7 @@ fn read_expensive_queries(
 async fn main() {
     env_logger::init();
 
-    let opt = opt::Opt::from_args();
+    let opt = opt::Opt::parse();
 
     // Set up logger
     let logger = logger(opt.debug);
@@ -223,7 +223,7 @@ async fn main() {
     let eth_networks = if query_only {
         EthereumNetworks::new()
     } else {
-        create_ethereum_networks(logger.clone(), metrics_registry.clone(), &config)
+        create_all_ethereum_networks(logger.clone(), metrics_registry.clone(), &config)
             .await
             .expect("Failed to parse Ethereum networks")
     };
@@ -460,6 +460,7 @@ async fn main() {
             node_id.clone(),
             logger.clone(),
         )
+        .await
         .expect("failed to start JSON-RPC admin server");
 
         // Let the server run forever.

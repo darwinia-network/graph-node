@@ -10,13 +10,12 @@ pub mod status;
 
 pub use features::{SubgraphFeature, SubgraphFeatureValidationError};
 
-use anyhow::ensure;
 use anyhow::{anyhow, Error};
 use futures03::{future::try_join3, stream::FuturesOrdered, TryStreamExt as _};
 use semver::Version;
 use serde::{de, ser};
 use serde_yaml;
-use slog::{debug, info, Logger};
+use slog::{info, Logger};
 use stable_hash::{FieldAddress, StableHash};
 use stable_hash_legacy::SequenceNumber;
 use std::{collections::BTreeSet, marker::PhantomData};
@@ -25,6 +24,7 @@ use wasmparser;
 use web3::types::Address;
 
 use crate::{
+    bail,
     blockchain::{BlockPtr, Blockchain, DataSource as _},
     components::{
         link_resolver::LinkResolver,
@@ -41,6 +41,7 @@ use crate::{
         offchain::OFFCHAIN_KINDS, DataSource, DataSourceTemplate, UnresolvedDataSource,
         UnresolvedDataSourceTemplate,
     },
+    ensure,
     prelude::{r, CheapClone, ENV_VARS},
 };
 
@@ -270,7 +271,7 @@ pub enum SubgraphRegistrarError {
     #[error("deployment assignment unchanged: {0}")]
     DeploymentAssignmentUnchanged(String),
     #[error("subgraph registrar internal query error: {0}")]
-    QueryExecutionError(QueryExecutionError),
+    QueryExecutionError(#[from] QueryExecutionError),
     #[error("subgraph registrar error with store: {0}")]
     StoreError(StoreError),
     #[error("subgraph validation error: {}", display_vector(.0))]
@@ -278,13 +279,7 @@ pub enum SubgraphRegistrarError {
     #[error("subgraph deployment error: {0}")]
     SubgraphDeploymentError(StoreError),
     #[error("subgraph registrar error: {0}")]
-    Unknown(anyhow::Error),
-}
-
-impl From<QueryExecutionError> for SubgraphRegistrarError {
-    fn from(e: QueryExecutionError) -> Self {
-        SubgraphRegistrarError::QueryExecutionError(e)
-    }
+    Unknown(#[from] anyhow::Error),
 }
 
 impl From<StoreError> for SubgraphRegistrarError {
@@ -293,12 +288,6 @@ impl From<StoreError> for SubgraphRegistrarError {
             StoreError::DeploymentNotFound(id) => SubgraphRegistrarError::DeploymentNotFound(id),
             e => SubgraphRegistrarError::StoreError(e),
         }
-    }
-}
-
-impl From<Error> for SubgraphRegistrarError {
-    fn from(e: Error) -> Self {
-        SubgraphRegistrarError::Unknown(e)
     }
 }
 
@@ -318,13 +307,7 @@ pub enum SubgraphAssignmentProviderError {
     #[error("Subgraph with ID {0} is not running")]
     NotRunning(DeploymentLocator),
     #[error("Subgraph provider error: {0}")]
-    Unknown(anyhow::Error),
-}
-
-impl From<Error> for SubgraphAssignmentProviderError {
-    fn from(e: Error) -> Self {
-        SubgraphAssignmentProviderError::Unknown(e)
-    }
+    Unknown(#[from] anyhow::Error),
 }
 
 impl From<::diesel::result::Error> for SubgraphAssignmentProviderError {
@@ -357,8 +340,8 @@ pub enum SubgraphManifestValidationError {
     SchemaValidationError(Vec<SchemaValidationError>),
     #[error("the graft base is invalid: {0}")]
     GraftBaseInvalid(String),
-    #[error("subgraph must use a single apiVersion across its data sources. Found: {}", format_versions(.0))]
-    DifferentApiVersions(BTreeSet<Version>),
+    #[error("subgraph must use a single apiVersion across its data sources. Found: {}", format_versions(&(.0).0))]
+    DifferentApiVersions(#[from] DifferentMappingApiVersions),
     #[error(transparent)]
     FeatureValidationError(#[from] SubgraphFeatureValidationError),
     #[error("data source {0} is invalid: {1}")]
@@ -368,19 +351,13 @@ pub enum SubgraphManifestValidationError {
 #[derive(Error, Debug)]
 pub enum SubgraphManifestResolveError {
     #[error("parse error: {0}")]
-    ParseError(serde_yaml::Error),
+    ParseError(#[from] serde_yaml::Error),
     #[error("subgraph is not UTF-8")]
     NonUtf8,
     #[error("subgraph is not valid YAML")]
     InvalidFormat,
     #[error("resolve error: {0}")]
-    ResolveError(anyhow::Error),
-}
-
-impl From<serde_yaml::Error> for SubgraphManifestResolveError {
-    fn from(e: serde_yaml::Error) -> Self {
-        SubgraphManifestResolveError::ParseError(e)
-    }
+    ResolveError(#[from] anyhow::Error),
 }
 
 /// Data source contexts are conveniently represented as entities.
@@ -520,7 +497,7 @@ pub struct BaseSubgraphManifest<C, S, D, T> {
 }
 
 /// SubgraphManifest with IPFS links unresolved
-type UnresolvedSubgraphManifest<C> = BaseSubgraphManifest<
+pub type UnresolvedSubgraphManifest<C> = BaseSubgraphManifest<
     C,
     UnresolvedSchema,
     UnresolvedDataSource<C>,
@@ -638,35 +615,16 @@ impl<C: Blockchain> SubgraphManifest<C> {
     /// Entry point for resolving a subgraph definition.
     pub async fn resolve_from_raw(
         id: DeploymentHash,
-        mut raw: serde_yaml::Mapping,
+        raw: serde_yaml::Mapping,
         resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
         max_spec_version: semver::Version,
     ) -> Result<Self, SubgraphManifestResolveError> {
-        // Inject the IPFS hash as the ID of the subgraph into the definition.
-        raw.insert("id".into(), id.to_string().into());
-
-        // Parse the YAML data into an UnresolvedSubgraphManifest
-        let unresolved: UnresolvedSubgraphManifest<C> = serde_yaml::from_value(raw.into())?;
-
-        debug!(logger, "Features {:?}", unresolved.features);
+        let unresolved = UnresolvedSubgraphManifest::parse(id, raw)?;
 
         let resolved = unresolved
             .resolve(resolver, logger, max_spec_version)
-            .await
-            .map_err(SubgraphManifestResolveError::ResolveError)?;
-
-        if (resolved.spec_version < SPEC_VERSION_0_0_7)
-            && resolved
-                .data_sources
-                .iter()
-                .any(|ds| OFFCHAIN_KINDS.contains(&ds.kind()))
-        {
-            return Err(SubgraphManifestResolveError::ResolveError(anyhow!(
-                "Offchain data sources not supported prior to {}",
-                SPEC_VERSION_0_0_7
-            )));
-        }
+            .await?;
 
         Ok(resolved)
     }
@@ -709,15 +667,37 @@ impl<C: Blockchain> SubgraphManifest<C> {
     ) -> Result<UnifiedMappingApiVersion, DifferentMappingApiVersions> {
         UnifiedMappingApiVersion::try_from_versions(self.api_versions())
     }
+
+    pub fn template_idx_and_name(&self) -> impl Iterator<Item = (u32, String)> + '_ {
+        // We cannot include static data sources in the map because a static data source and a
+        // template may have the same name in the manifest. Duplicated with
+        // `UnresolvedSubgraphManifest::template_idx_and_name`.
+        let ds_len = self.data_sources.len() as u32;
+        self.templates
+            .iter()
+            .map(|t| t.name().to_owned())
+            .enumerate()
+            .map(move |(idx, name)| (ds_len + idx as u32, name))
+    }
 }
 
 impl<C: Blockchain> UnresolvedSubgraphManifest<C> {
+    pub fn parse(
+        id: DeploymentHash,
+        mut raw: serde_yaml::Mapping,
+    ) -> Result<Self, SubgraphManifestResolveError> {
+        // Inject the IPFS hash as the ID of the subgraph into the definition.
+        raw.insert("id".into(), id.to_string().into());
+
+        serde_yaml::from_value(raw.into()).map_err(Into::into)
+    }
+
     pub async fn resolve(
         self,
         resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
         max_spec_version: semver::Version,
-    ) -> Result<SubgraphManifest<C>, anyhow::Error> {
+    ) -> Result<SubgraphManifest<C>, SubgraphManifestResolveError> {
         let UnresolvedSubgraphManifest {
             id,
             spec_version,
@@ -738,14 +718,14 @@ impl<C: Blockchain> UnresolvedSubgraphManifest<C> {
                 max_spec_version,
                 id,
                 spec_version
-            ));
+            ).into());
         }
 
         let ds_count = data_sources.len();
         if ds_count as u64 + templates.len() as u64 > u32::MAX as u64 {
-            return Err(anyhow!(
-                "Subgraph has too many declared data sources and templates",
-            ));
+            return Err(
+                anyhow!("Subgraph has too many declared data sources and templates",).into(),
+            );
         }
 
         let (schema, data_sources, templates) = try_join3(
@@ -775,6 +755,17 @@ impl<C: Blockchain> UnresolvedSubgraphManifest<C> {
                 "The maximum supported mapping API version of this indexer is {}, but `{}` was found",
                 ENV_VARS.mappings.max_api_version,
                 ds.api_version()
+            );
+        }
+
+        if spec_version < SPEC_VERSION_0_0_7
+            && data_sources
+                .iter()
+                .any(|ds| OFFCHAIN_KINDS.contains(&ds.kind()))
+        {
+            bail!(
+                "Offchain data sources not supported prior to {}",
+                SPEC_VERSION_0_0_7
             );
         }
 

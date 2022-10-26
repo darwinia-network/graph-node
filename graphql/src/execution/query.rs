@@ -2,10 +2,8 @@ use graph::data::graphql::DocumentExt as _;
 use graph::data::value::Object;
 use graphql_parser::Pos;
 use graphql_tools::validation::rules::*;
-use graphql_tools::validation::utils::ValidationError;
 use graphql_tools::validation::validate::{validate, ValidationPlan};
 use lazy_static::lazy_static;
-use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::iter::FromIterator;
@@ -26,11 +24,6 @@ use crate::query::{ast as qast, ext::BlockConstraint};
 use crate::schema::ast::{self as sast};
 use crate::values::coercion;
 use crate::{execution::get_field, schema::api::ErrorPolicy};
-
-lazy_static! {
-    static ref GRAPHQL_VALIDATION_CACHE: Mutex<HashMap<u64, Vec<ValidationError>>> =
-        Mutex::new(HashMap::<u64, Vec<ValidationError>>::new());
-}
 
 lazy_static! {
     static ref GRAPHQL_VALIDATION_PLAN: ValidationPlan =
@@ -149,27 +142,11 @@ fn validate_query(
     query: &GraphDataQuery,
     document: &s::Document,
 ) -> Result<(), Vec<QueryExecutionError>> {
-    let errors = {
-        let cached = GRAPHQL_VALIDATION_CACHE
-            .lock()
-            .get(&query.shape_hash)
-            .cloned();
-        match cached {
-            Some(cached) => cached,
-            None => {
-                let validation_errors =
-                    validate(&document, &query.document, &GRAPHQL_VALIDATION_PLAN);
-                GRAPHQL_VALIDATION_CACHE
-                    .lock()
-                    .insert(query.shape_hash, validation_errors.clone());
-                validation_errors
-            }
-        }
-    };
+    let validation_errors = validate(&document, &query.document, &GRAPHQL_VALIDATION_PLAN);
 
-    if !errors.is_empty() {
+    if !validation_errors.is_empty() {
         if !ENV_VARS.graphql.silent_graphql_validations {
-            return Err(errors
+            return Err(validation_errors
                 .into_iter()
                 .map(|e| {
                     QueryExecutionError::ValidationError(
@@ -184,7 +161,7 @@ fn validate_query(
               "GraphQL Validation failure";
               "query" => &query.query_text,
               "variables" => &query.variables_text,
-              "errors" => format!("[{:?}]", errors.iter().map(|e| e.message.clone()).collect::<Vec<_>>().join(", "))
+              "errors" => format!("[{:?}]", validation_errors.iter().map(|e| e.message.clone()).collect::<Vec<_>>().join(", "))
             );
         }
     }
@@ -206,8 +183,20 @@ impl Query {
         max_depth: u8,
         metrics: Arc<dyn GraphQLMetrics>,
     ) -> Result<Arc<Self>, Vec<QueryExecutionError>> {
+        let query_hash = {
+            let mut hasher = DefaultHasher::new();
+            query.query_text.hash(&mut hasher);
+            query.variables_text.hash(&mut hasher);
+            hasher.finish()
+        };
+        let query_id = format!("{:x}-{:x}", query.shape_hash, query_hash);
+        let logger = logger.new(o!(
+            "subgraph_id" => schema.id().clone(),
+            "query_id" => query_id.clone()
+        ));
+
         let validation_phase_start = Instant::now();
-        validate_query(logger, &query, &schema.document())?;
+        validate_query(&logger, &query, &schema.document())?;
         metrics.observe_query_validation(validation_phase_start.elapsed(), schema.id());
 
         let mut operation = None;
@@ -241,18 +230,6 @@ impl Query {
                 )])
             }
         };
-
-        let query_hash = {
-            let mut hasher = DefaultHasher::new();
-            query.query_text.hash(&mut hasher);
-            query.variables_text.hash(&mut hasher);
-            hasher.finish()
-        };
-        let query_id = format!("{:x}-{:x}", query.shape_hash, query_hash);
-        let logger = logger.new(o!(
-            "subgraph_id" => schema.id().clone(),
-            "query_id" => query_id.clone()
-        ));
 
         let start = Instant::now();
         let root_type = match kind {

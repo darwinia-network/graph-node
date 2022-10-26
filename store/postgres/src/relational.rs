@@ -14,6 +14,8 @@ mod ddl_tests;
 #[cfg(test)]
 mod query_tests;
 
+mod prune;
+
 use diesel::{connection::SimpleConnection, Connection};
 use diesel::{debug_query, OptionalExtension, PgConnection, RunQueryDsl};
 use graph::cheap_clone::CheapClone;
@@ -671,6 +673,7 @@ impl Layout {
             range,
             block,
             query_id,
+            &self.site,
         )?;
         let query_clone = query.clone();
 
@@ -1243,6 +1246,22 @@ impl Table {
         Ok(table)
     }
 
+    /// Create a table that is like `self` except that its name in the
+    /// database is based on `namespace` and `name`
+    pub fn new_like(&self, namespace: &Namespace, name: &SqlName) -> Arc<Table> {
+        let other = Table {
+            object: self.object.clone(),
+            name: name.clone(),
+            qualified_name: SqlName::qualified_name(namespace, &name),
+            columns: self.columns.clone(),
+            is_account_like: self.is_account_like,
+            position: self.position,
+            immutable: self.immutable,
+        };
+
+        Arc::new(other)
+    }
+
     /// Find the column `name` in this table. The name must be in snake case,
     /// i.e., use SQL conventions
     pub fn column(&self, name: &SqlName) -> Option<&Column> {
@@ -1289,6 +1308,13 @@ impl Table {
             .iter()
             .find(|column| column.is_primary_key())
             .expect("every table has a primary key")
+    }
+
+    pub(crate) fn analyze(&self, conn: &PgConnection) -> Result<(), StoreError> {
+        let table_name = &self.qualified_name;
+        let sql = format!("analyze {table_name}");
+        conn.execute(&sql)?;
+        Ok(())
     }
 }
 
@@ -1417,6 +1443,14 @@ impl LayoutCache {
                 Ok(layout)
             }
         }
+    }
+
+    pub(crate) fn remove(&self, site: &Site) -> Option<Arc<Layout>> {
+        self.entries
+            .lock()
+            .unwrap()
+            .remove(&site.deployment)
+            .map(|CacheEntry { value, expires: _ }| value.clone())
     }
 
     // Only needed for tests

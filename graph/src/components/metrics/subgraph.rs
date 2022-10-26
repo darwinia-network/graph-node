@@ -1,18 +1,28 @@
+use prometheus::Counter;
+
 use crate::blockchain::block_stream::BlockStreamMetrics;
 use crate::prelude::{Gauge, Histogram, HostMetrics, MetricsRegistry};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::stopwatch::StopwatchMetrics;
+
 pub struct SubgraphInstanceMetrics {
     pub block_trigger_count: Box<Histogram>,
     pub block_processing_duration: Box<Histogram>,
     pub block_ops_transaction_duration: Box<Histogram>,
+    pub firehose_connection_errors: Counter,
 
+    pub stopwatch: StopwatchMetrics,
     trigger_processing_duration: Box<Histogram>,
 }
 
 impl SubgraphInstanceMetrics {
-    pub fn new(registry: Arc<dyn MetricsRegistry>, subgraph_hash: &str) -> Self {
+    pub fn new(
+        registry: Arc<dyn MetricsRegistry>,
+        subgraph_hash: &str,
+        stopwatch: StopwatchMetrics,
+    ) -> Self {
         let block_trigger_count = registry
             .new_deployment_histogram(
                 "deployment_block_trigger_count",
@@ -46,11 +56,21 @@ impl SubgraphInstanceMetrics {
             )
             .expect("failed to create `deployment_transact_block_operations_duration_{}");
 
+        let firehose_connection_errors = registry
+            .new_deployment_counter(
+                "firehose_connection_errors",
+                "Measures connections when trying to obtain a firehose connection",
+                subgraph_hash,
+            )
+            .expect("failed to create firehose_connection_errors counter");
+
         Self {
             block_trigger_count,
             block_processing_duration,
             trigger_processing_duration,
             block_ops_transaction_duration,
+            firehose_connection_errors,
+            stopwatch,
         }
     }
 

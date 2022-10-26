@@ -1,9 +1,9 @@
 use async_trait::async_trait;
-use graph::blockchain::Blockchain;
+use graph::blockchain::{Block, Blockchain};
 use graph::cheap_clone::CheapClone;
 use graph::components::store::SubgraphFork;
 use graph::components::subgraph::{MappingError, SharedProofOfIndexing};
-use graph::data_source::TriggerData;
+use graph::data_source::{MappingTrigger, TriggerData, TriggerWithHandler};
 use graph::prelude::tokio::time::Instant;
 use graph::prelude::{
     BlockState, RuntimeHost, RuntimeHostBuilder, SubgraphInstanceMetrics, TriggerProcessor,
@@ -33,21 +33,35 @@ where
     ) -> Result<BlockState<C>, MappingError> {
         let error_count = state.deterministic_errors.len();
 
+        let mut host_mapping: Vec<(&T::Host, TriggerWithHandler<MappingTrigger<C>>)> = vec![];
+
+        {
+            let _section = subgraph_metrics.stopwatch.start_section("match_and_decode");
+
+            for host in hosts {
+                let mapping_trigger = match host.match_and_decode(trigger, block, logger)? {
+                    // Trigger matches and was decoded as a mapping trigger.
+                    Some(mapping_trigger) => mapping_trigger,
+
+                    // Trigger does not match, do not process it.
+                    None => continue,
+                };
+
+                host_mapping.push((&host, mapping_trigger));
+            }
+        }
+
+        if host_mapping.is_empty() {
+            return Ok(state);
+        }
+
         if let Some(proof_of_indexing) = proof_of_indexing {
             proof_of_indexing
                 .borrow_mut()
                 .start_handler(causality_region);
         }
 
-        for host in hosts {
-            let mapping_trigger = match host.match_and_decode(trigger, block, logger)? {
-                // Trigger matches and was decoded as a mapping trigger.
-                Some(mapping_trigger) => mapping_trigger,
-
-                // Trigger does not match, do not process it.
-                None => continue,
-            };
-
+        for (host, mapping_trigger) in host_mapping {
             let start = Instant::now();
             state = host
                 .process_mapping_trigger(
@@ -62,11 +76,12 @@ where
             let elapsed = start.elapsed().as_secs_f64();
             subgraph_metrics.observe_trigger_processing_duration(elapsed);
 
-            if host.data_source().as_offchain().is_some() {
+            if let Some(ds) = host.data_source().as_offchain() {
+                ds.mark_processed_at(block.number());
                 // Remove this offchain data source since it has just been processed.
                 state
-                    .offchain_to_remove
-                    .push(host.data_source().as_stored_dynamic_data_source());
+                    .processed_data_sources
+                    .push(ds.as_stored_dynamic_data_source());
             }
         }
 

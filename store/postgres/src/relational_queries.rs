@@ -41,7 +41,7 @@ use crate::{
         BlockRangeColumn, BlockRangeLowerBoundClause, BlockRangeUpperBoundClause, BLOCK_COLUMN,
         BLOCK_RANGE_COLUMN, BLOCK_RANGE_CURRENT,
     },
-    primary::Namespace,
+    primary::{Namespace, Site},
 };
 
 /// Those are columns that we always want to fetch from the database.
@@ -1906,6 +1906,7 @@ impl ParentIds {
 #[derive(Debug, Clone)]
 enum TableLink<'a> {
     Direct(&'a Column, ChildMultiplicity),
+    /// The `Table` is the parent table
     Parent(&'a Table, ParentIds),
 }
 
@@ -2190,6 +2191,7 @@ impl<'a> FilterWindow<'a> {
 
     fn children_type_c(
         &self,
+        parent_primary_key: &Column,
         child_ids: &[Vec<Option<SafeString>>],
         limit: ParentLimit<'_>,
         block: BlockNumber,
@@ -2209,7 +2211,7 @@ impl<'a> FilterWindow<'a> {
 
         out.push_sql("\n/* children_type_c */  from ");
         out.push_sql("rows from (unnest(");
-        out.push_bind_param::<Array<Text>, _>(&self.ids)?;
+        parent_primary_key.bind_ids(&self.ids, out)?;
         out.push_sql("), reduce_dim(");
         self.table.primary_key().push_matrix(child_ids, out)?;
         out.push_sql(")) as p(id, child_ids)");
@@ -2292,9 +2294,13 @@ impl<'a> FilterWindow<'a> {
                     }
                 }
             }
-            TableLink::Parent(_, ParentIds::List(child_ids)) => {
-                self.children_type_c(child_ids, limit, block, &mut out)
-            }
+            TableLink::Parent(parent_table, ParentIds::List(child_ids)) => self.children_type_c(
+                parent_table.primary_key(),
+                child_ids,
+                limit,
+                block,
+                &mut out,
+            ),
             TableLink::Parent(_, ParentIds::Scalar(child_ids)) => {
                 self.child_type_d(child_ids, limit, block, &mut out)
             }
@@ -2820,6 +2826,7 @@ pub struct FilterQuery<'a> {
     range: FilterRange,
     block: BlockNumber,
     query_id: Option<String>,
+    site: &'a Site,
 }
 
 /// String representation that is useful for debugging when `walk_ast` fails
@@ -2845,6 +2852,7 @@ impl<'a> FilterQuery<'a> {
         range: EntityRange,
         block: BlockNumber,
         query_id: Option<String>,
+        site: &'a Site,
     ) -> Result<Self, QueryExecutionError> {
         let sort_key = SortKey::new(order, collection, filter, block)?;
 
@@ -2854,6 +2862,7 @@ impl<'a> FilterQuery<'a> {
             range: FilterRange(range),
             block,
             query_id,
+            site,
         })
     }
 
@@ -3114,10 +3123,17 @@ impl<'a> QueryFragment<Pg> for FilterQuery<'a> {
             return Ok(());
         }
 
+        // Tag the query with various information to make connecting it to
+        // the GraphQL query it came from easier. The names of the tags are
+        // chosen so that GCP's Query Insights will recognize them
         if let Some(qid) = &self.query_id {
-            out.push_sql("/* qid: ");
+            out.push_sql("/* controller='filter',application='");
+            out.push_sql(self.site.namespace.as_str());
+            out.push_sql("',route='");
             out.push_sql(qid);
-            out.push_sql(" */\n");
+            out.push_sql("',action='");
+            out.push_sql(&self.block.to_string());
+            out.push_sql("' */\n");
         }
         // We generate four different kinds of queries, depending on whether
         // we need to window and whether we query just one or multiple entity
