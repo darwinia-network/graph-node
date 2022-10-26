@@ -330,11 +330,12 @@ pub enum IndexForAscTypeId {
     CosmosValidatorSetUpdates = 1559,
     CosmosValidatorUpdate = 1560,
     CosmosVersionParams = 1561,
-
+    CosmosMessageData = 1562,
+    CosmosTransactionContext = 1563,
     // Continue to add more Cosmos type IDs here.
     // e.g.:
-    // NextCosmosType = 1562,
-    // AnotherCosmosType = 1563,
+    // NextCosmosType = 1564,
+    // AnotherCosmosType = 1565,
     // ...
     // LastCosmosType = 2499,
 
@@ -426,19 +427,13 @@ impl std::error::Error for DeterministicHostError {}
 #[derive(thiserror::Error, Debug)]
 pub enum HostExportError {
     #[error("{0:#}")]
-    Unknown(anyhow::Error),
+    Unknown(#[from] anyhow::Error),
 
     #[error("{0:#}")]
     PossibleReorg(anyhow::Error),
 
     #[error("{0:#}")]
     Deterministic(anyhow::Error),
-}
-
-impl From<anyhow::Error> for HostExportError {
-    fn from(e: anyhow::Error) -> Self {
-        HostExportError::Unknown(e)
-    }
 }
 
 impl From<DeterministicHostError> for HostExportError {

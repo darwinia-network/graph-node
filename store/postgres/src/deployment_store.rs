@@ -3,8 +3,9 @@ use diesel::connection::SimpleConnection;
 use diesel::pg::PgConnection;
 use diesel::prelude::*;
 use diesel::r2d2::{ConnectionManager, PooledConnection};
+use graph::anyhow::Context;
 use graph::blockchain::block_stream::FirehoseCursor;
-use graph::components::store::{EntityKey, EntityType, StoredDynamicDataSource};
+use graph::components::store::{EntityKey, EntityType, PruneReporter, StoredDynamicDataSource};
 use graph::components::versions::VERSIONS;
 use graph::data::query::Trace;
 use graph::data::subgraph::{status, SPEC_VERSION_0_0_6};
@@ -211,7 +212,8 @@ impl DeploymentStore {
         site: &Site,
     ) -> Result<SubgraphDeploymentEntity, StoreError> {
         let conn = self.get_conn()?;
-        detail::deployment_entity(&conn, site)
+        Ok(detail::deployment_entity(&conn, site)
+            .with_context(|| format!("Deployment details not found for {}", site.deployment))?)
     }
 
     // Remove the data and metadata for the deployment `site`. This operation
@@ -698,10 +700,7 @@ impl DeploymentStore {
         let entity_name = entity_name.to_owned();
         let layout = store.layout(&conn, site)?;
         let table = resolve_table_name(&layout, &entity_name)?;
-        let table_name = &table.qualified_name;
-        let sql = format!("analyze {table_name}");
-        conn.execute(&sql)?;
-        Ok(())
+        table.analyze(conn)
     }
 
     /// Creates a new index in the specified Entity table if it doesn't already exist.
@@ -778,6 +777,77 @@ impl DeploymentStore {
         self.with_conn(move |conn, _| {
             let schema_name = site.namespace.clone();
             catalog::drop_index(conn, schema_name.as_str(), &index_name).map_err(Into::into)
+        })
+        .await
+    }
+
+    pub(crate) async fn set_account_like(
+        &self,
+        site: Arc<Site>,
+        table: &str,
+        is_account_like: bool,
+    ) -> Result<(), StoreError> {
+        let store = self.clone();
+        let table = table.to_string();
+        self.with_conn(move |conn, _| {
+            let layout = store.layout(conn, site.clone())?;
+            let table = resolve_table_name(&layout, &table)?;
+            catalog::set_account_like(conn, &site, &table.name, is_account_like).map_err(Into::into)
+        })
+        .await
+    }
+
+    pub(crate) async fn prune(
+        self: &Arc<Self>,
+        mut reporter: Box<dyn PruneReporter>,
+        site: Arc<Site>,
+        earliest_block: BlockNumber,
+        reorg_threshold: BlockNumber,
+        prune_ratio: f64,
+    ) -> Result<Box<dyn PruneReporter>, StoreError> {
+        let store = self.clone();
+        self.with_conn(move |conn, cancel| {
+            let layout = store.layout(conn, site.clone())?;
+            cancel.check_cancel()?;
+            let state = deployment::state(&conn, site.deployment.clone())?;
+
+            if state.latest_block.number <= reorg_threshold {
+                return Ok(reporter);
+            }
+
+            if state.earliest_block_number > earliest_block {
+                return Err(constraint_violation!("earliest block can not move back from {} to {}", state.earliest_block_number, earliest_block).into());
+            }
+
+            let final_block = state.latest_block.number - reorg_threshold;
+            if final_block <= earliest_block {
+                return Err(constraint_violation!("the earliest block {} must be at least {} blocks before the current latest block {}", earliest_block, reorg_threshold, state.latest_block.number).into());
+            }
+
+            if let Some((_, graft)) = deployment::graft_point(conn, &site.deployment)? {
+                if graft.block_number() >= earliest_block {
+                    return Err(constraint_violation!("the earliest block {} must be after the graft point {}", earliest_block, graft.block_number()).into());
+                }
+            }
+
+            cancel.check_cancel()?;
+
+            conn.transaction(|| {
+                deployment::set_earliest_block(conn, site.as_ref(), earliest_block)
+            })?;
+
+            cancel.check_cancel()?;
+
+            layout.prune_by_copying(
+                &store.logger,
+                reporter.as_mut(),
+                conn,
+                earliest_block,
+                final_block,
+                prune_ratio,
+                cancel,
+            )?;
+            Ok(reporter)
         })
         .await
     }
@@ -987,7 +1057,7 @@ impl DeploymentStore {
         data_sources: &[StoredDynamicDataSource],
         deterministic_errors: &[SubgraphError],
         manifest_idx_and_name: &[(u32, String)],
-        offchain_to_remove: &[StoredDynamicDataSource],
+        processed_data_sources: &[StoredDynamicDataSource],
     ) -> Result<StoreEvent, StoreError> {
         let conn = {
             let _section = stopwatch.start_section("transact_blocks_get_conn");
@@ -1003,6 +1073,10 @@ impl DeploymentStore {
 
             // Make the changes
             let layout = self.layout(&conn, site.clone())?;
+
+            //  see also: deployment-lock-for-update
+            deployment::lock(&conn, &site)?;
+
             let section = stopwatch.start_section("apply_entity_modifications");
             let count = self.apply_entity_modifications(
                 &conn,
@@ -1021,7 +1095,7 @@ impl DeploymentStore {
                 manifest_idx_and_name,
             )?;
 
-            dynds::remove_offchain(&conn, &site, offchain_to_remove)?;
+            dynds::update_offchain_status(&conn, &site, processed_data_sources)?;
 
             if !deterministic_errors.is_empty() {
                 deployment::insert_subgraph_errors(
@@ -1055,6 +1129,9 @@ impl DeploymentStore {
         firehose_cursor: &FirehoseCursor,
     ) -> Result<StoreEvent, StoreError> {
         let event = conn.transaction(|| -> Result<_, StoreError> {
+            //  see also: deployment-lock-for-update
+            deployment::lock(conn, &site)?;
+
             // Don't revert past a graft point
             let info = self.subgraph_info_with_conn(conn, site.as_ref())?;
             if let Some(graft_block) = info.graft_block {
@@ -1228,18 +1305,24 @@ impl DeploymentStore {
         &self,
         logger: &Logger,
         site: Arc<Site>,
-        graft_src: Option<(Arc<Layout>, BlockPtr)>,
+        graft_src: Option<(Arc<Layout>, BlockPtr, SubgraphDeploymentEntity)>,
     ) -> Result<(), StoreError> {
         let dst = self.find_layout(site.cheap_clone())?;
 
-        // Do any cleanup to bring the subgraph into a known good state
-        if let Some((src, block)) = graft_src {
+        // If `graft_src` is `Some`, then there is a pending graft.
+        if let Some((src, block, src_deployment)) = graft_src {
             info!(
                 logger,
                 "Initializing graft by copying data from {} to {}",
                 src.catalog.site.namespace,
                 dst.catalog.site.namespace
             );
+
+            let src_manifest_idx_and_name = src_deployment.manifest.template_idx_and_name()?;
+            let dst_manifest_idx_and_name = self
+                .load_deployment(&dst.site)?
+                .manifest
+                .template_idx_and_name()?;
 
             // Copy subgraph data
             // We allow both not copying tables at all from the source, as well
@@ -1252,6 +1335,8 @@ impl DeploymentStore {
                 src.clone(),
                 dst.clone(),
                 block.clone(),
+                src_manifest_idx_and_name,
+                dst_manifest_idx_and_name,
             )?;
             let status = copy_conn.copy_data()?;
             if status == crate::copy::Status::Cancelled {
@@ -1511,6 +1596,17 @@ impl DeploymentStore {
         let id = site.id.clone();
         self.with_conn(move |conn, _| deployment::health(conn, id).map_err(Into::into))
             .await
+    }
+
+    pub(crate) async fn set_manifest_raw_yaml(
+        &self,
+        site: Arc<Site>,
+        raw_yaml: String,
+    ) -> Result<(), StoreError> {
+        self.with_conn(move |conn, _| {
+            deployment::set_manifest_raw_yaml(&conn, &site, &raw_yaml).map_err(Into::into)
+        })
+        .await
     }
 }
 

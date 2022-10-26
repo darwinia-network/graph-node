@@ -24,7 +24,7 @@ async fn main() -> Result<(), Error> {
         "https://api.streamingfast.io:443",
         token,
         false,
-        1,
+        false,
     ));
 
     loop {

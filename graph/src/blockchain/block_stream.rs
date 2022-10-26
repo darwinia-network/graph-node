@@ -10,7 +10,7 @@ use super::{Block, BlockPtr, Blockchain};
 use crate::anyhow::Result;
 use crate::components::store::{BlockNumber, DeploymentLocator};
 use crate::data::subgraph::UnifiedMappingApiVersion;
-use crate::firehose;
+use crate::firehose::{self, FirehoseEndpoint};
 use crate::substreams::BlockScopedData;
 use crate::{prelude::*, prometheus::labels};
 
@@ -254,6 +254,7 @@ pub trait FirehoseMapper<C: Blockchain>: Send + Sync {
     async fn block_ptr_for_number(
         &self,
         logger: &Logger,
+        endpoint: &Arc<FirehoseEndpoint>,
         number: BlockNumber,
     ) -> Result<BlockPtr, Error>;
 
@@ -271,6 +272,7 @@ pub trait FirehoseMapper<C: Blockchain>: Send + Sync {
     async fn final_block_ptr_for(
         &self,
         logger: &Logger,
+        endpoint: &Arc<FirehoseEndpoint>,
         block: &C::Block,
     ) -> Result<BlockPtr, Error>;
 }
@@ -299,6 +301,8 @@ pub enum FirehoseError {
 
 #[derive(Error, Debug)]
 pub enum SubstreamsError {
+    #[error("response is missing the clock information")]
+    MissingClockError,
     /// We were unable to decode the received block payload into the chain specific Block struct (e.g. chain_ethereum::pb::Block)
     #[error("received gRPC block payload cannot be decoded: {0}")]
     DecodingError(#[from] prost::DecodeError),
@@ -308,10 +312,13 @@ pub enum SubstreamsError {
     UnknownError(#[from] anyhow::Error),
 
     #[error("multiple module output error")]
-    MultipleModuleOutputError(),
+    MultipleModuleOutputError,
+
+    #[error("module output was not available (none) or wrong data provided")]
+    ModuleOutputNotPresentOrUnexpected,
 
     #[error("unexpected store delta output")]
-    UnexpectedStoreDeltaOutput(),
+    UnexpectedStoreDeltaOutput,
 }
 
 #[derive(Debug)]

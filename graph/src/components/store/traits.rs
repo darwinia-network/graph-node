@@ -130,12 +130,21 @@ pub trait SubgraphStore: Send + Sync + 'static {
     /// Return a `WritableStore` that is used for indexing subgraphs. Only
     /// code that is part of indexing a subgraph should ever use this. The
     /// `logger` will be used to log important messages related to the
-    /// subgraph
+    /// subgraph.
+    ///
+    /// This function should only be called in situations where no
+    /// assumptions about the in-memory state of writing has been made; in
+    /// particular, no assumptions about whether previous writes have
+    /// actually been committed or not.
     async fn writable(
         self: Arc<Self>,
         logger: Logger,
         deployment: DeploymentId,
     ) -> Result<Arc<dyn WritableStore>, StoreError>;
+
+    /// Initiate a graceful shutdown of the writable that a previous call to
+    /// `writable` might have started
+    async fn stop_subgraph(&self, deployment: &DeploymentLocator) -> Result<(), StoreError>;
 
     /// Return the minimum block pointer of all deployments with this `id`
     /// that we would use to query or copy from; in particular, this will
@@ -147,6 +156,13 @@ pub trait SubgraphStore: Send + Sync + 'static {
 
     /// Find the deployment locators for the subgraph with the given hash
     fn locators(&self, hash: &str) -> Result<Vec<DeploymentLocator>, StoreError>;
+
+    /// This migrates subgraphs that existed before the raw_yaml column was added.
+    async fn set_manifest_raw_yaml(
+        &self,
+        hash: &DeploymentHash,
+        raw_yaml: String,
+    ) -> Result<(), StoreError>;
 }
 
 pub trait ReadStore: Send + Sync + 'static {

@@ -4,14 +4,13 @@ use crate::{
     cheap_clone::CheapClone,
     components::store::BlockNumber,
     firehose::{decode_firehose_block, ForkStep},
-    prelude::{debug, info},
+    prelude::{anyhow, debug, info},
     substreams,
 };
 use futures03::StreamExt;
 use http::uri::{Scheme, Uri};
-use rand::prelude::IteratorRandom;
 use slog::Logger;
-use std::{collections::BTreeMap, fmt::Display, iter, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, fmt::Display, sync::Arc, time::Duration};
 use tonic::{
     metadata::MetadataValue,
     transport::{Channel, ClientTlsConfig},
@@ -20,11 +19,14 @@ use tonic::{
 
 use super::codec as firehose;
 
+const SUBGRAPHS_PER_CONN: usize = 100;
+
 #[derive(Clone, Debug)]
 pub struct FirehoseEndpoint {
     pub provider: String,
     pub token: Option<String>,
     pub filters_enabled: bool,
+    pub compression_enabled: bool,
     channel: Channel,
 }
 
@@ -40,7 +42,7 @@ impl FirehoseEndpoint {
         url: S,
         token: Option<String>,
         filters_enabled: bool,
-        conn_pool_size: u16,
+        compression_enabled: bool,
     ) -> Self {
         let uri = url
             .as_ref()
@@ -73,14 +75,12 @@ impl FirehoseEndpoint {
             // Timeout on each request, so the timeout to estabilish each 'Blocks' stream.
             .timeout(Duration::from_secs(120));
 
-        // Load balancing on a same endpoint is useful because it creates a connection pool.
-        let channel = Channel::balance_list(iter::repeat(endpoint).take(conn_pool_size as usize));
-
         FirehoseEndpoint {
             provider: provider.as_ref().to_string(),
-            channel,
+            channel: endpoint.connect_lazy(),
             token,
             filters_enabled,
+            compression_enabled,
         }
     }
 
@@ -119,7 +119,12 @@ impl FirehoseEndpoint {
 
                 Ok(r)
             },
-        );
+        )
+        .accept_gzip();
+
+        if self.compression_enabled {
+            client = client.send_gzip();
+        }
 
         debug!(
             logger,
@@ -208,7 +213,11 @@ impl FirehoseEndpoint {
 
                 Ok(r)
             },
-        );
+        )
+        .accept_gzip();
+        if self.compression_enabled {
+            client = client.send_gzip();
+        }
 
         let response_stream = client.blocks(request).await?;
         let block_stream = response_stream.into_inner();
@@ -255,10 +264,21 @@ impl FirehoseEndpoints {
         self.0.len()
     }
 
-    pub fn random(&self) -> Option<&Arc<FirehoseEndpoint>> {
-        // Select from the matching adapters randomly
-        let mut rng = rand::thread_rng();
-        self.0.iter().choose(&mut rng)
+    // selects the FirehoseEndpoint with the least amount of references, which will help with spliting
+    // the load naively across the entire list.
+    pub fn random(&self) -> anyhow::Result<Arc<FirehoseEndpoint>> {
+        let endpoint = self
+            .0
+            .iter()
+            .min_by_key(|x| Arc::strong_count(x))
+            .ok_or(anyhow!("no available firehose endpoints"))?;
+        if Arc::strong_count(endpoint) > SUBGRAPHS_PER_CONN {
+            return Err(anyhow!("all connections saturated with {} connections, increase the firehose conn_pool_size", SUBGRAPHS_PER_CONN));
+        }
+
+        // Cloning here ensure we have the correct count at any given time, if we return a reference it can be cloned later
+        // which could cause a high number of endpoints to be given away before accounting for them.
+        Ok(endpoint.clone())
     }
 
     pub fn remove(&mut self, provider: &str) {
@@ -316,5 +336,45 @@ impl FirehoseNetworks {
                     .map(move |endpoint| (chain_id.clone(), endpoint.clone()))
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::{mem, str::FromStr, sync::Arc};
+
+    use http::Uri;
+    use tonic::transport::Channel;
+
+    use super::{FirehoseEndpoint, FirehoseEndpoints, SUBGRAPHS_PER_CONN};
+
+    #[tokio::test]
+    async fn firehose_endpoint_errors() {
+        let endpoint = vec![Arc::new(FirehoseEndpoint {
+            provider: String::new(),
+            token: None,
+            filters_enabled: true,
+            compression_enabled: true,
+            channel: Channel::builder(Uri::from_str("http://127.0.0.1").unwrap()).connect_lazy(),
+        })];
+
+        let mut endpoints = FirehoseEndpoints::from(endpoint);
+
+        let mut keep = vec![];
+        for _i in 0..SUBGRAPHS_PER_CONN {
+            keep.push(endpoints.random().unwrap());
+        }
+
+        let err = endpoints.random().unwrap_err();
+        assert!(err.to_string().contains("conn_pool_size"));
+
+        mem::drop(keep);
+        endpoints.random().unwrap();
+
+        // Fails when empty too
+        endpoints.remove("");
+
+        let err = endpoints.random().unwrap_err();
+        assert!(err.to_string().contains("no available firehose endpoints"));
     }
 }
